@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "workspaceRoot": "/path/to/workspace",
+  "runtime": {
+    "nodePath": "",
+    "wsModulePath": "",
+    "companionDir": "",
+    "pollIntervalMs": 2500,
+    "telegramLongPollTimeoutSec": 40,
+    "shellTimeoutMs": 60000,
+    "stdoutMaxBytes": 2097152
+  },
+  "agent": {
+    "cwd": "/path/to/workspace",
+    "agentPreset": "standard",
+    "provider": null,
+    "model": null
+  },
+  "adapters": {
+    "onebot": {
+      "enabled": true,
+      "endpoint": "http://127.0.0.1:5700",
+      "accessToken": "",
+      "webhookPath": "/messaging/onebot",
+      "selfId": null
+    },
+    "telegram": {
+      "enabled": false,
+      "token": "",
+      "mode": "polling",
+      "webhookPath": "/messaging/telegram/webhook",
+      "pollIntervalMs": 2500,
+      "longPollTimeoutSec": 40,
+      "dropPendingUpdates": false
+    },
+    "discord": {
+      "enabled": false,
+      "botToken": "",
+      "intents": 33281,
+      "wsModulePath": "/Applications/deeprein.app/Contents/Resources/_up_/backend/dsh/node_modules/ws"
+    },
+    "slack": {
+      "enabled": false,
+      "botToken": "",
+      "signingSecret": "",
+      "verificationToken": "",
+      "webhookPath": "/messaging/slack/events"
+    },
+    "lark": {
+      "enabled": false,
+      "appId": "",
+      "appSecret": "",
+      "verificationToken": "",
+      "encryptKey": "",
+      "webhookPath": "/messaging/lark/events"
+    },
+    "wecom": {
+      "enabled": false,
+      "corpId": "",
+      "agentId": "",
+      "secret": "",
+      "token": "",
+      "encodingAESKey": "",
+      "webhookPath": "/messaging/wecom/callback"
+    },
+    "wechat": {
+      "enabled": false,
+      "driver": "wcf",
+      "baseUrl": "http://127.0.0.1:8080",
+      "collectPath": "/message/callback/collect",
+      "sendTextPath": "/send-text",
+      "postTextPath": "/message/postText",
+      "appId": "",
+      "pollIntervalMs": 2500
+    }
+  }
+}
