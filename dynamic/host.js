@@ -160,6 +160,37 @@ function xmlTag(xml, tag) {
   return (match[1] !== undefined ? match[1] : match[2] || '').trim()
 }
 
+// --- Personal WeChat via the ilink Bot API (Tencent/openclaw-weixin protocol) ---
+
+function asciiBase64(input) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  let result = ''
+  let index = 0
+  while (index < input.length) {
+    const c1 = input.charCodeAt(index) & 0xff
+    const c2 = index + 1 < input.length ? input.charCodeAt(index + 1) & 0xff : null
+    const c3 = index + 2 < input.length ? input.charCodeAt(index + 2) & 0xff : null
+    index += 3
+    result += chars.charAt(c1 >> 2)
+    result += chars.charAt(((c1 & 3) << 4) | (c2 === null ? 0 : c2 >> 4))
+    result += c2 === null ? '=' : chars.charAt(((c2 & 15) << 2) | (c3 === null ? 0 : c3 >> 6))
+    result += c3 === null ? '=' : chars.charAt(c3 & 63)
+  }
+  return result
+}
+
+// Headers shared by every ilink Bot API request (see openclaw-weixin src/api/api.ts).
+function ilinkHeaders(token) {
+  const headers = {
+    'AuthorizationType': 'ilink_bot_token',
+    'iLink-App-Id': 'bot',
+    'iLink-App-ClientVersion': '65536', // 0x00010000 (channel_version 1.0.0)
+    'X-WECHAT-UIN': asciiBase64(String(Math.floor(Math.random() * 0x100000000))),
+  }
+  if (token) headers.Authorization = 'Bearer ' + token
+  return headers
+}
+
 return {
   name: 'dsh-messaging',
   inject: ['webServer', 'shell', 'fs', 'agents', 'timer', 'agentDefaultModel'],
@@ -187,6 +218,8 @@ return {
       wecomToken: null,
       wechatSeen: Object.create(null),
       wechatPolling: false,
+      wechatUpdatesBuf: '',
+      wechatContextTokens: Object.create(null),
       discordProc: null,
     }
 
@@ -258,13 +291,11 @@ return {
           },
           wechat: {
             enabled: false,
-            driver: 'wcf',
-            baseUrl: 'http://127.0.0.1:8080',
-            collectPath: '/message/callback/collect',
-            sendTextPath: '/send-text',
-            postTextPath: '/message/postText',
-            appId: '',
+            baseUrl: 'https://ilinkai.weixin.qq.com',
+            token: '',
+            botAgent: 'dsh-messaging',
             pollIntervalMs: 2500,
+            longPollTimeoutSec: 35,
           },
         },
       }
@@ -1119,74 +1150,117 @@ return {
       return state.wecomToken.value
     }
 
-    // Personal WeChat bridge
+    // Personal WeChat via the ilink Bot API (Tencent/openclaw-weixin protocol)
     function startWechat(cfg) {
       const disposers = []
+      const baseUrl = trimTrailingSlash(cfg.baseUrl || 'https://ilinkai.weixin.qq.com')
+      const token = cfg.token || ''
+      const baseInfo = { channel_version: '1.0.0', bot_agent: cfg.botAgent || 'dsh-messaging' }
+
       state.adapters.wechat = {
         sendText: async (conversation, text) => {
           const target = String(conversation).replace(/^wechat:/, '')
-          const isGewe = cfg.driver === 'gewe'
-          const url = isGewe
-            ? joinUrl(cfg.baseUrl, cfg.postTextPath || '/message/postText')
-            : joinUrl(cfg.baseUrl, cfg.sendTextPath || '/send-text')
-          const payload = isGewe
-            ? { toUserName: target, content: text, ...(cfg.appId ? { appId: cfg.appId } : {}) }
-            : { wxid: target, text }
-          const response = await httpPostJson(url, payload)
-          return { ok: response.ok, status: response.status, error: response.ok ? null : response.stderr || response.text || ('HTTP ' + response.status) }
+          const contextToken = state.wechatContextTokens[conversation] || ''
+          const payload = {
+            msg: {
+              to_user_id: target,
+              ...(contextToken ? { context_token: contextToken } : {}),
+              item_list: [{ type: 1, text_item: { text: String(text) } }],
+            },
+            base_info: baseInfo,
+          }
+          const response = await httpPostJson(joinUrl(baseUrl, 'ilink/bot/sendmessage'), payload, ilinkHeaders(token))
+          const ret = response.json && typeof response.json.ret === 'number' ? response.json.ret : -1
+          return {
+            ok: response.ok && ret === 0,
+            status: response.status,
+            error: ret !== 0 ? (response.json && response.json.errmsg) || response.stderr || ('HTTP ' + response.status) : null,
+          }
         },
       }
-      disposers.push(ctx.interval(() => {
+
+      const startLoop = () => {
         if (state.wechatPolling) return
         state.wechatPolling = true
-        const generation = state.generation
-        pollWechat(cfg, generation)
+        const loopGeneration = state.generation
+        wechatPollLoop(cfg, baseUrl, token, baseInfo, loopGeneration)
           .catch((error) => {
-            if (generation === state.generation) recordError('wechat', error, 'bridge poll')
+            if (loopGeneration === state.generation) recordError('wechat', error, 'ilink long-poll loop')
           })
           .finally(() => {
-            if (generation === state.generation) state.wechatPolling = false
+            if (loopGeneration === state.generation) state.wechatPolling = false
           })
-      }, clamp(Number(cfg.pollIntervalMs || state.config.runtime.pollIntervalMs || 2500), 500, 60000)))
-      setChannelState('wechat', 'running', { driver: cfg.driver, baseUrl: cfg.baseUrl })
+      }
+
+      // Watchdog restarts the loop if it died; the loop itself is continuous.
+      disposers.push(ctx.interval(startLoop, clamp(Number(cfg.pollIntervalMs || state.config.runtime.pollIntervalMs || 2500), 1000, 60000)))
+      startLoop()
+
+      setChannelState('wechat', 'running', { driver: 'ilink', baseUrl })
       return disposers
     }
 
-    async function pollWechat(cfg, generation) {
-      const url = joinUrl(cfg.baseUrl, cfg.collectPath || '/message/callback/collect')
-      const response = await httpGetJson(url, {}, { timeoutMs: 15000 })
-      if (generation !== state.generation) return
-      if (!response.ok) throw new Error(response.json && response.json.error || response.stderr || ('HTTP ' + response.status))
-      const messages = normalizeWechatMessages(response.json)
-      for (const message of messages) {
-        const id = message.id || message.msgId || message.msg_id
-        if (id === undefined || id === null || id === '' || state.wechatSeen[id]) continue
-        state.wechatSeen[id] = true
-        const seenKeys = Object.keys(state.wechatSeen)
-        if (seenKeys.length > 5000) for (const key of seenKeys.slice(0, 2000)) delete state.wechatSeen[key]
-        const fromUser = message.fromUserName || message.from_user || message.wxid || message.fromUser
-        const text = message.content || message.text || ''
-        if (!fromUser || !text) continue
-        inbound('wechat', 'wechat:' + fromUser, text, {
-          fromUser,
-          messageId: id,
-          driver: cfg.driver,
-        })
+    async function wechatPollLoop(cfg, baseUrl, token, baseInfo, loopGeneration) {
+      while (state.wechatPolling && loopGeneration === state.generation) {
+        const timeoutMs = Math.ceil((Number(cfg.longPollTimeoutSec || 35) + 15) * 1000)
+        const payload = { get_updates_buf: state.wechatUpdatesBuf, base_info: baseInfo }
+        const response = await httpPostJson(joinUrl(baseUrl, 'ilink/bot/getupdates'), payload, ilinkHeaders(token), { timeoutMs })
+        if (loopGeneration !== state.generation) return
+        if (!response.ok) {
+          throw new Error((response.json && (response.json.errmsg || response.json.error)) || response.stderr || ('HTTP ' + response.status))
+        }
+        const body = response.json || {}
+        if (body.ret !== undefined && body.ret !== 0) {
+          if (body.ret === -14 || body.errcode === -14) {
+            // Session expired: reset the sync cursor and retry after a short pause.
+            state.wechatUpdatesBuf = ''
+            await new Promise((resolve) => ctx.timeout(resolve, 2000))
+            continue
+          }
+          throw new Error('getupdates ret=' + body.ret + ' errmsg=' + (body.errmsg || ''))
+        }
+        if (typeof body.get_updates_buf === 'string') state.wechatUpdatesBuf = body.get_updates_buf
+        const msgs = Array.isArray(body.msgs) ? body.msgs : []
+        for (const message of msgs) processIlinkMessage(message)
+        setChannelState('wechat', 'running', { driver: 'ilink', baseUrl })
       }
-      setChannelState('wechat', 'running', { driver: cfg.driver, baseUrl: cfg.baseUrl })
     }
 
-    function normalizeWechatMessages(payload) {
-      if (!payload) return []
-      const direct = payload.messages || payload.data || payload.result
-      if (Array.isArray(direct)) return direct
-      if (Array.isArray(payload)) return payload
-      if (Array.isArray(direct && direct.messages)) return direct.messages
-      if (Array.isArray(direct && direct.data)) return direct.data
-      if (Array.isArray(direct && direct.messageList)) return direct.messageList
-      if (Array.isArray(direct && direct.list)) return direct.list
-      if (Array.isArray(direct && direct.callbackList)) return direct.callbackList
-      return []
+    function processIlinkMessage(message) {
+      if (!isObject(message)) return
+      // Only USER-originated messages; BOT messages (message_type 2) are our own replies.
+      if (message.message_type !== undefined && Number(message.message_type) !== 1) return
+      const messageId = message.message_id !== undefined ? String(message.message_id) : (message.seq !== undefined ? String(message.seq) : null)
+      if (messageId) {
+        if (state.wechatSeen[messageId]) return
+        state.wechatSeen[messageId] = true
+        const seenKeys = Object.keys(state.wechatSeen)
+        if (seenKeys.length > 5000) for (const key of seenKeys.slice(0, 2000)) delete state.wechatSeen[key]
+      }
+      const fromUser = message.from_user_id || ''
+      if (!fromUser) return
+      const text = extractIlinkText(message.item_list)
+      if (!text) return
+      const conversation = 'wechat:' + fromUser
+      if (typeof message.context_token === 'string' && message.context_token) {
+        state.wechatContextTokens[conversation] = message.context_token
+      }
+      inbound('wechat', conversation, text, {
+        fromUser,
+        messageId,
+        sessionId: message.session_id || null,
+      })
+    }
+
+    function extractIlinkText(itemList) {
+      if (!Array.isArray(itemList)) return ''
+      return itemList
+        .map((item) => {
+          if (!isObject(item)) return ''
+          if (item.type === 1 && item.text_item && typeof item.text_item.text === 'string') return item.text_item.text
+          return ''
+        })
+        .join('')
     }
 
     async function startAdapter(def) {
@@ -1250,6 +1324,8 @@ return {
       state.telegramPolling = false
       state.wechatPolling = false
       state.wechatSeen = Object.create(null)
+      state.wechatUpdatesBuf = ''
+      state.wechatContextTokens = Object.create(null)
     }
 
     async function rebuildAll(overrideConfig) {

@@ -65,13 +65,11 @@
     },
     "wechat": {
       "enabled": false,
-      "driver": "wcf",
-      "baseUrl": "http://127.0.0.1:8080",
-      "collectPath": "/message/callback/collect",
-      "sendTextPath": "/send-text",
-      "postTextPath": "/message/postText",
-      "appId": "",
-      "pollIntervalMs": 2500
+      "baseUrl": "https://ilinkai.weixin.qq.com",
+      "token": "",
+      "botAgent": "dsh-messaging",
+      "pollIntervalMs": 2500,
+      "longPollTimeoutSec": 35
     }
   }
 }
