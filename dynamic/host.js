@@ -8,6 +8,28 @@ const CHANNEL_DEFS = [
   { key: 'wechat', label: 'Personal WeChat', kind: 'bridge' },
 ]
 
+// Agentless shell calls (curl HTTP, companion node scripts) cannot resolve a
+// per-session workspace-write ACL root; the deployment fallback root is not
+// always ACL-grantable, so these fixed-shape commands run unconfined.
+const SHELL_SANDBOX_POLICY = { mode: 'danger-full-access' }
+
+// The host shell executor runs PowerShell. Quote every argument with pwsh
+// single-quote doubling and leave the command name unquoted so the statement
+// parses in command mode (adjacent quoted literals are a syntax error).
+function pwshQuote(value) {
+  const text = String(value)
+  if (text === '') return "''"
+  return "'" + text.replace(/'/g, "''") + "'"
+}
+
+function buildCommand(parts) {
+  if (!Array.isArray(parts) || parts.length === 0) return ''
+  const head = String(parts[0])
+  const rest = parts.slice(1)
+  if (rest.length === 0) return head
+  return head + ' ' + rest.map(pwshQuote).join(' ')
+}
+
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
@@ -39,10 +61,6 @@ function safeJsonParse(text, fallback) {
   } catch {
     return fallback
   }
-}
-
-function shellQuote(value) {
-  return "'" + String(value).replace(/'/g, "'\\''") + "'"
 }
 
 function trimTrailingSlash(value) {
@@ -144,7 +162,7 @@ function xmlTag(xml, tag) {
 
 return {
   name: 'dsh-messaging',
-  inject: ['webServer', 'shell', 'fs', 'agents', 'timer'],
+  inject: ['webServer', 'shell', 'fs', 'agents', 'timer', 'agentDefaultModel'],
 
   async apply(ctx) {
     const state = {
@@ -425,13 +443,26 @@ return {
       return state.workspaceRoot
     }
 
+    function defaultModelSelection() {
+      try {
+        const selection = ctx.agentDefaultModel.currentSelection()
+        if (selection && typeof selection === 'object') return selection
+      } catch (error) {
+        recordError(null, error, 'default model selection')
+      }
+      return null
+    }
+
     async function ensureAgent(record) {
       const existing = state.conversationAgents[record.key]
       if (existing && existing.agent) return existing.agent
       const sessionId = safeSessionId(record.key)
       const agentOptions = {}
-      if (state.config.agent && state.config.agent.provider) agentOptions.provider = state.config.agent.provider
-      if (state.config.agent && state.config.agent.model) agentOptions.model = state.config.agent.model
+      const configuredProvider = state.config.agent && state.config.agent.provider
+      const configuredModel = state.config.agent && state.config.agent.model
+      const selection = (configuredProvider && configuredModel) ? null : defaultModelSelection()
+      agentOptions.provider = configuredProvider || (selection && selection.provider) || ''
+      agentOptions.model = configuredModel || (selection && selection.model) || ''
       const meta = {
         cwd: await resolveAgentCwd(),
       }
@@ -444,6 +475,11 @@ return {
       })
       record.sessionId = sessionId
       record.agentId = handle.agent.id
+      record.meta = deepMerge(record.meta || {}, {
+        provider: agentOptions.provider || null,
+        model: agentOptions.model || null,
+      })
+      record.meta = cleanJson(record.meta)
       state.sessionToConversation[sessionId] = record
       state.conversationAgents[record.key] = {
         handle,
@@ -561,13 +597,15 @@ return {
       }
       parts.push('-w', '\n__DSH_STATUS__:%{http_code}')
       parts.push(url)
-      const command = parts.map(shellQuote).join(' ')
-      const result = await ctx.shell.run({
+      const command = buildCommand(parts)
+      const spec = ctx.shell.resolve({
         command,
         stdin: body === undefined || body === null ? undefined : String(body),
         timeoutMs,
         stdoutMaxBytes,
+        sandboxPolicy: SHELL_SANDBOX_POLICY,
       })
+      const result = await ctx.shell.run(spec)
       const stdout = (result.stdout && result.stdout.text) || ''
       const stderr = (result.stderr && result.stderr.text) || ''
       const marker = '\n__DSH_STATUS__:'
@@ -655,16 +693,17 @@ return {
     function companionCommand(script, args) {
       const nodePath = state.config.runtime.nodePath || 'node'
       const companionDir = state.config.runtime.companionDir || joinPath(state.workspaceRoot, '.dsh-messaging/companion')
-      return [nodePath, joinPath(companionDir, script), ...(args || [])].map(shellQuote).join(' ')
+      return buildCommand([nodePath, joinPath(companionDir, script), ...(args || [])])
     }
 
     async function companionRun(script, args, input, timeoutMs) {
-      const result = await ctx.shell.run({
+      const result = await ctx.shell.run(ctx.shell.resolve({
         command: companionCommand(script, args),
         stdin: input === undefined ? undefined : JSON.stringify(input),
         timeoutMs: timeoutMs || 30000,
         stdoutMaxBytes: Number(state.config.runtime.stdoutMaxBytes || 1024 * 1024),
-      })
+        sandboxPolicy: SHELL_SANDBOX_POLICY,
+      }))
       const stdout = (result.stdout && result.stdout.text) || ''
       const stderr = (result.stderr && result.stderr.text) || ''
       if (result.exitCode !== 0 || !stdout.trim()) {
@@ -824,10 +863,11 @@ return {
     function startDiscord(cfg) {
       const disposers = []
       const modulePath = cfg.wsModulePath || state.config.runtime.wsModulePath
-      const proc = ctx.shell.start({
+      const proc = ctx.shell.start(ctx.shell.resolve({
         command: companionCommand('discord-gateway.cjs', ['--ws-module', modulePath || 'ws']),
         stdin: JSON.stringify({ token: cfg.botToken, intents: cfg.intents || 33281 }),
-      })
+        sandboxPolicy: SHELL_SANDBOX_POLICY,
+      }))
       state.discordProc = proc
       disposers.push(ctx.effect(() => () => proc.kill()))
       let buffer = ''

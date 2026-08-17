@@ -62,7 +62,7 @@ function treeText(node) {
 }
 
 function main() {
-  const React = makeReact([fixtureConfig, '', '', false])
+  const React = makeReact([0, fixtureConfig, '', '', false])
   const factory = new Function('React', 'host', clientSource)
   const plugin = factory(React, host)
   plugin.apply(ctx)
@@ -71,7 +71,7 @@ function main() {
   const panel = registrations.find((entry) => entry.options.name === 'tool.view.cordis')
   assert.ok(section, 'settings.section registration should exist')
   assert.equal(section.options.id, 'messaging')
-  assert.equal(section.options.label(), 'Messaging')
+  assert.equal(section.options.label(), 'Message Channel Configuration')
   assert.ok(panel, 'tool.view.cordis registration should still exist')
 
   const element = section.component({ close() {} })

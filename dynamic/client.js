@@ -1,80 +1,243 @@
 const CHANNELS = [
-  { key: 'onebot', label: 'OneBot v11' },
-  { key: 'telegram', label: 'Telegram' },
-  { key: 'discord', label: 'Discord' },
-  { key: 'slack', label: 'Slack' },
-  { key: 'lark', label: 'Lark / Feishu' },
-  { key: 'wecom', label: 'WeCom' },
-  { key: 'wechat', label: 'Personal WeChat' },
+  { key: 'onebot', label: 'channel.onebot' },
+  { key: 'telegram', label: 'channel.telegram' },
+  { key: 'discord', label: 'channel.discord' },
+  { key: 'slack', label: 'channel.slack' },
+  { key: 'lark', label: 'channel.lark' },
+  { key: 'wecom', label: 'channel.wecom' },
+  { key: 'wechat', label: 'channel.wechat' },
 ]
 
 const RUNTIME_FIELDS = [
-  { key: 'nodePath', label: 'Node executable', type: 'text' },
-  { key: 'wsModulePath', label: 'ws module path', type: 'text' },
-  { key: 'companionDir', label: 'Companion directory', type: 'text' },
-  { key: 'pollIntervalMs', label: 'Poll interval (ms)', type: 'number' },
-  { key: 'telegramLongPollTimeoutSec', label: 'Telegram long-poll timeout (s)', type: 'number' },
-  { key: 'shellTimeoutMs', label: 'Shell timeout (ms)', type: 'number' },
-  { key: 'stdoutMaxBytes', label: 'stdout max bytes', type: 'number' },
+  { key: 'nodePath', label: 'field.runtime.nodePath', type: 'text' },
+  { key: 'wsModulePath', label: 'field.runtime.wsModulePath', type: 'text' },
+  { key: 'companionDir', label: 'field.runtime.companionDir', type: 'text' },
+  { key: 'pollIntervalMs', label: 'field.runtime.pollIntervalMs', type: 'number' },
+  { key: 'telegramLongPollTimeoutSec', label: 'field.runtime.telegramLongPollTimeoutSec', type: 'number' },
+  { key: 'shellTimeoutMs', label: 'field.runtime.shellTimeoutMs', type: 'number' },
+  { key: 'stdoutMaxBytes', label: 'field.runtime.stdoutMaxBytes', type: 'number' },
 ]
 
 const AGENT_FIELDS = [
-  { key: 'cwd', label: 'Agent cwd', type: 'text' },
-  { key: 'agentPreset', label: 'Agent preset', type: 'text' },
-  { key: 'provider', label: 'Provider', type: 'text' },
-  { key: 'model', label: 'Model', type: 'text' },
+  { key: 'cwd', label: 'field.agent.cwd', type: 'text' },
+  { key: 'agentPreset', label: 'field.agent.agentPreset', type: 'text' },
+  { key: 'provider', label: 'field.agent.provider', type: 'text' },
+  { key: 'model', label: 'field.agent.model', type: 'text' },
 ]
 
 const CHANNEL_FIELDS = {
   onebot: [
-    { key: 'endpoint', label: 'OneBot endpoint', type: 'text' },
-    { key: 'accessToken', label: 'Access token', type: 'password' },
-    { key: 'webhookPath', label: 'Webhook path', type: 'text' },
-    { key: 'selfId', label: 'Self id (echo suppression)', type: 'number' },
+    { key: 'endpoint', label: 'field.onebot.endpoint', type: 'text' },
+    { key: 'accessToken', label: 'field.onebot.accessToken', type: 'password' },
+    { key: 'webhookPath', label: 'field.onebot.webhookPath', type: 'text' },
+    { key: 'selfId', label: 'field.onebot.selfId', type: 'number' },
   ],
   telegram: [
-    { key: 'token', label: 'Bot token', type: 'password' },
-    { key: 'mode', label: 'Mode', type: 'select', options: ['polling', 'webhook'] },
-    { key: 'webhookPath', label: 'Webhook path', type: 'text' },
-    { key: 'pollIntervalMs', label: 'Poll interval (ms)', type: 'number' },
-    { key: 'longPollTimeoutSec', label: 'Long-poll timeout (s)', type: 'number' },
-    { key: 'dropPendingUpdates', label: 'Drop pending updates', type: 'boolean' },
+    { key: 'token', label: 'field.telegram.token', type: 'password' },
+    { key: 'mode', label: 'field.telegram.mode', type: 'select', options: ['polling', 'webhook'] },
+    { key: 'webhookPath', label: 'field.telegram.webhookPath', type: 'text' },
+    { key: 'pollIntervalMs', label: 'field.telegram.pollIntervalMs', type: 'number' },
+    { key: 'longPollTimeoutSec', label: 'field.telegram.longPollTimeoutSec', type: 'number' },
+    { key: 'dropPendingUpdates', label: 'field.telegram.dropPendingUpdates', type: 'boolean' },
   ],
   discord: [
-    { key: 'botToken', label: 'Bot token', type: 'password' },
-    { key: 'intents', label: 'Gateway intents', type: 'number' },
-    { key: 'wsModulePath', label: 'ws module path', type: 'text' },
+    { key: 'botToken', label: 'field.discord.botToken', type: 'password' },
+    { key: 'intents', label: 'field.discord.intents', type: 'number' },
+    { key: 'wsModulePath', label: 'field.discord.wsModulePath', type: 'text' },
   ],
   slack: [
-    { key: 'botToken', label: 'Bot token', type: 'password' },
-    { key: 'signingSecret', label: 'Signing secret', type: 'password' },
-    { key: 'verificationToken', label: 'Verification token', type: 'password' },
-    { key: 'webhookPath', label: 'Webhook path', type: 'text' },
+    { key: 'botToken', label: 'field.slack.botToken', type: 'password' },
+    { key: 'signingSecret', label: 'field.slack.signingSecret', type: 'password' },
+    { key: 'verificationToken', label: 'field.slack.verificationToken', type: 'password' },
+    { key: 'webhookPath', label: 'field.slack.webhookPath', type: 'text' },
   ],
   lark: [
-    { key: 'appId', label: 'App id', type: 'text' },
-    { key: 'appSecret', label: 'App secret', type: 'password' },
-    { key: 'verificationToken', label: 'Verification token', type: 'password' },
-    { key: 'encryptKey', label: 'Encrypt key', type: 'password' },
-    { key: 'webhookPath', label: 'Webhook path', type: 'text' },
+    { key: 'appId', label: 'field.lark.appId', type: 'text' },
+    { key: 'appSecret', label: 'field.lark.appSecret', type: 'password' },
+    { key: 'verificationToken', label: 'field.lark.verificationToken', type: 'password' },
+    { key: 'encryptKey', label: 'field.lark.encryptKey', type: 'password' },
+    { key: 'webhookPath', label: 'field.lark.webhookPath', type: 'text' },
   ],
   wecom: [
-    { key: 'corpId', label: 'Corp id', type: 'text' },
-    { key: 'agentId', label: 'Agent id', type: 'text' },
-    { key: 'secret', label: 'Secret', type: 'password' },
-    { key: 'token', label: 'Callback token', type: 'password' },
-    { key: 'encodingAESKey', label: 'Encoding AES key', type: 'password' },
-    { key: 'webhookPath', label: 'Webhook path', type: 'text' },
+    { key: 'corpId', label: 'field.wecom.corpId', type: 'text' },
+    { key: 'agentId', label: 'field.wecom.agentId', type: 'text' },
+    { key: 'secret', label: 'field.wecom.secret', type: 'password' },
+    { key: 'token', label: 'field.wecom.token', type: 'password' },
+    { key: 'encodingAESKey', label: 'field.wecom.encodingAESKey', type: 'password' },
+    { key: 'webhookPath', label: 'field.wecom.webhookPath', type: 'text' },
   ],
   wechat: [
-    { key: 'driver', label: 'Driver', type: 'select', options: ['wcf', 'gewe'] },
-    { key: 'baseUrl', label: 'Bridge base URL', type: 'text' },
-    { key: 'collectPath', label: 'Collect path', type: 'text' },
-    { key: 'sendTextPath', label: 'Send-text path (wcf)', type: 'text' },
-    { key: 'postTextPath', label: 'Post-text path (gewe)', type: 'text' },
-    { key: 'appId', label: 'App id (gewe)', type: 'text' },
-    { key: 'pollIntervalMs', label: 'Poll interval (ms)', type: 'number' },
+    { key: 'driver', label: 'field.wechat.driver', type: 'select', options: ['wcf', 'gewe'] },
+    { key: 'baseUrl', label: 'field.wechat.baseUrl', type: 'text' },
+    { key: 'collectPath', label: 'field.wechat.collectPath', type: 'text' },
+    { key: 'sendTextPath', label: 'field.wechat.sendTextPath', type: 'text' },
+    { key: 'postTextPath', label: 'field.wechat.postTextPath', type: 'text' },
+    { key: 'appId', label: 'field.wechat.appId', type: 'text' },
+    { key: 'pollIntervalMs', label: 'field.wechat.pollIntervalMs', type: 'number' },
   ],
+}
+
+const LOCALE_NS = 'dsh-messaging'
+
+const LOCALE_DICTS = {
+  zh: {
+    'channel.onebot': 'OneBot v11',
+    'channel.telegram': 'Telegram',
+    'channel.discord': 'Discord',
+    'channel.slack': 'Slack',
+    'channel.lark': '飞书 / Lark',
+    'channel.wecom': '企业微信',
+    'channel.wechat': '个人微信',
+    'settings.title': '消息通道配置',
+    'settings.reload': '重新加载',
+    'settings.save': '保存',
+    'settings.saving': '保存中…',
+    'settings.saved': '已保存，适配器已重载',
+    'settings.loading': '正在加载配置…',
+    'settings.error': '错误：{msg}',
+    'settings.general': '通用',
+    'settings.workspaceRoot': '工作区根目录',
+    'settings.runtime': '运行时',
+    'settings.agent': '智能体',
+    'settings.notice': '配置保存在 .dsh-messaging/config.json，保存后生效。',
+    'settings.enabled': '已启用',
+    'settings.disabled': '已禁用',
+    'settings.enableField': '启用',
+    'panel.title': 'dsh-messaging 网关',
+    'panel.reload': '重新加载',
+    'panel.reloading': '重载中…',
+    'panel.inOut': '入 {in} / 出 {out}',
+    'panel.lastError': '最后错误：{msg}',
+    'panel.sessions': '会话（{n}）',
+    'panel.recent': '最近动态',
+    'panel.sessionRow': '{channel} · {conversation} · 消息 {n}',
+    'panel.eventRow': '{kind} · {channel} · {text}',
+    'field.runtime.nodePath': 'Node 可执行文件',
+    'field.runtime.wsModulePath': 'ws 模块路径',
+    'field.runtime.companionDir': '伴生脚本目录',
+    'field.runtime.pollIntervalMs': '轮询间隔（毫秒）',
+    'field.runtime.telegramLongPollTimeoutSec': 'Telegram 长轮询超时（秒）',
+    'field.runtime.shellTimeoutMs': 'Shell 超时（毫秒）',
+    'field.runtime.stdoutMaxBytes': 'stdout 最大字节数',
+    'field.agent.cwd': '智能体工作目录',
+    'field.agent.agentPreset': '智能体预设',
+    'field.agent.provider': '提供商',
+    'field.agent.model': '模型',
+    'field.onebot.endpoint': 'OneBot 端点',
+    'field.onebot.accessToken': '访问令牌',
+    'field.onebot.webhookPath': 'Webhook 路径',
+    'field.onebot.selfId': '自身 ID（回显抑制）',
+    'field.telegram.token': '机器人令牌',
+    'field.telegram.mode': '模式',
+    'field.telegram.webhookPath': 'Webhook 路径',
+    'field.telegram.pollIntervalMs': '轮询间隔（毫秒）',
+    'field.telegram.longPollTimeoutSec': '长轮询超时（秒）',
+    'field.telegram.dropPendingUpdates': '丢弃待处理更新',
+    'field.discord.botToken': '机器人令牌',
+    'field.discord.intents': '网关意图',
+    'field.discord.wsModulePath': 'ws 模块路径',
+    'field.slack.botToken': '机器人令牌',
+    'field.slack.signingSecret': '签名密钥',
+    'field.slack.verificationToken': '验证令牌',
+    'field.slack.webhookPath': 'Webhook 路径',
+    'field.lark.appId': '应用 ID',
+    'field.lark.appSecret': '应用密钥',
+    'field.lark.verificationToken': '验证令牌',
+    'field.lark.encryptKey': '加密密钥',
+    'field.lark.webhookPath': 'Webhook 路径',
+    'field.wecom.corpId': '企业 ID',
+    'field.wecom.agentId': '应用 ID',
+    'field.wecom.secret': '密钥',
+    'field.wecom.token': '回调令牌',
+    'field.wecom.encodingAESKey': 'AES 加密密钥',
+    'field.wecom.webhookPath': 'Webhook 路径',
+    'field.wechat.driver': '驱动',
+    'field.wechat.baseUrl': '桥接基础 URL',
+    'field.wechat.collectPath': '消息拉取路径',
+    'field.wechat.sendTextPath': '发送文本路径（wcf）',
+    'field.wechat.postTextPath': '发送文本路径（gewe）',
+    'field.wechat.appId': '应用 ID（gewe）',
+    'field.wechat.pollIntervalMs': '轮询间隔（毫秒）',
+  },
+  en: {
+    'channel.onebot': 'OneBot v11',
+    'channel.telegram': 'Telegram',
+    'channel.discord': 'Discord',
+    'channel.slack': 'Slack',
+    'channel.lark': 'Lark / Feishu',
+    'channel.wecom': 'WeCom',
+    'channel.wechat': 'Personal WeChat',
+    'settings.title': 'Message Channel Configuration',
+    'settings.reload': 'Reload',
+    'settings.save': 'Save',
+    'settings.saving': 'Saving…',
+    'settings.saved': 'Saved; adapters reloaded',
+    'settings.loading': 'Loading configuration…',
+    'settings.error': 'Error: {msg}',
+    'settings.general': 'General',
+    'settings.workspaceRoot': 'Workspace root',
+    'settings.runtime': 'Runtime',
+    'settings.agent': 'Agent',
+    'settings.notice': 'Configuration is stored in .dsh-messaging/config.json and applies after Save.',
+    'settings.enabled': 'enabled',
+    'settings.disabled': 'disabled',
+    'settings.enableField': 'Enabled',
+    'panel.title': 'dsh-messaging gateway',
+    'panel.reload': 'Reload',
+    'panel.reloading': 'Reloading…',
+    'panel.inOut': 'in {in} / out {out}',
+    'panel.lastError': 'last error: {msg}',
+    'panel.sessions': 'Sessions ({n})',
+    'panel.recent': 'Recent',
+    'panel.sessionRow': '{channel} · {conversation} · msgs {n}',
+    'panel.eventRow': '{kind} · {channel} · {text}',
+    'field.runtime.nodePath': 'Node executable',
+    'field.runtime.wsModulePath': 'ws module path',
+    'field.runtime.companionDir': 'Companion directory',
+    'field.runtime.pollIntervalMs': 'Poll interval (ms)',
+    'field.runtime.telegramLongPollTimeoutSec': 'Telegram long-poll timeout (s)',
+    'field.runtime.shellTimeoutMs': 'Shell timeout (ms)',
+    'field.runtime.stdoutMaxBytes': 'stdout max bytes',
+    'field.agent.cwd': 'Agent cwd',
+    'field.agent.agentPreset': 'Agent preset',
+    'field.agent.provider': 'Provider',
+    'field.agent.model': 'Model',
+    'field.onebot.endpoint': 'OneBot endpoint',
+    'field.onebot.accessToken': 'Access token',
+    'field.onebot.webhookPath': 'Webhook path',
+    'field.onebot.selfId': 'Self id (echo suppression)',
+    'field.telegram.token': 'Bot token',
+    'field.telegram.mode': 'Mode',
+    'field.telegram.webhookPath': 'Webhook path',
+    'field.telegram.pollIntervalMs': 'Poll interval (ms)',
+    'field.telegram.longPollTimeoutSec': 'Long-poll timeout (s)',
+    'field.telegram.dropPendingUpdates': 'Drop pending updates',
+    'field.discord.botToken': 'Bot token',
+    'field.discord.intents': 'Gateway intents',
+    'field.discord.wsModulePath': 'ws module path',
+    'field.slack.botToken': 'Bot token',
+    'field.slack.signingSecret': 'Signing secret',
+    'field.slack.verificationToken': 'Verification token',
+    'field.slack.webhookPath': 'Webhook path',
+    'field.lark.appId': 'App id',
+    'field.lark.appSecret': 'App secret',
+    'field.lark.verificationToken': 'Verification token',
+    'field.lark.encryptKey': 'Encrypt key',
+    'field.lark.webhookPath': 'Webhook path',
+    'field.wecom.corpId': 'Corp id',
+    'field.wecom.agentId': 'Agent id',
+    'field.wecom.secret': 'Secret',
+    'field.wecom.token': 'Callback token',
+    'field.wecom.encodingAESKey': 'Encoding AES key',
+    'field.wecom.webhookPath': 'Webhook path',
+    'field.wechat.driver': 'Driver',
+    'field.wechat.baseUrl': 'Bridge base URL',
+    'field.wechat.collectPath': 'Collect path',
+    'field.wechat.sendTextPath': 'Send-text path (wcf)',
+    'field.wechat.postTextPath': 'Post-text path (gewe)',
+    'field.wechat.appId': 'App id (gewe)',
+    'field.wechat.pollIntervalMs': 'Poll interval (ms)',
+  },
 }
 
 function cloneJson(value) {
@@ -92,6 +255,15 @@ function displayValue(value) {
   return value === undefined || value === null ? '' : String(value)
 }
 
+function useLocaleRefresh(ctx) {
+  const [, setRevision] = React.useState(0)
+  React.useEffect(() => {
+    const locale = ctx.get('locale')
+    if (!locale || typeof locale.subscribe !== 'function') return
+    return locale.subscribe(() => setRevision((revision) => revision + 1))
+  }, [])
+}
+
 return {
   name: 'dsh-messaging-client',
   inject: ['timer'],
@@ -99,6 +271,19 @@ return {
   apply(ctx) {
     const slots = ctx.get('slots')
     if (slots === undefined) return
+
+    const locale = ctx.get('locale')
+    let t
+    if (locale && typeof locale.register === 'function' && typeof locale.bind === 'function') {
+      ctx.effect(() => locale.register(LOCALE_NS, LOCALE_DICTS))
+      t = locale.bind(LOCALE_NS)
+    } else {
+      t = (key, params) => {
+        const template = (LOCALE_DICTS.en && LOCALE_DICTS.en[key]) || key
+        if (!params) return template
+        return template.replace(/\{(\w+)\}/g, (match, name) => name in params ? String(params[name]) : match)
+      }
+    }
 
     const styles = {
       root: {
@@ -229,6 +414,7 @@ return {
     }
 
     function MessagingSettingsSection() {
+      useLocaleRefresh(ctx)
       const [config, setConfig] = React.useState(null)
       const [message, setMessage] = React.useState('')
       const [error, setError] = React.useState('')
@@ -268,7 +454,7 @@ return {
         setError('')
         try {
           await host.call('messaging_set_config', cloneJson(config))
-          setMessage('Saved; adapters reloaded')
+          setMessage(t('settings.saved'))
         } catch (saveError) {
           setError(saveError && saveError.message ? saveError.message : String(saveError))
         } finally {
@@ -278,7 +464,7 @@ return {
 
       if (!config) {
         return React.createElement('div', { style: styles.form },
-          error ? React.createElement('div', { style: styles.muted }, 'Error: ' + error) : React.createElement('div', { style: styles.muted }, 'Loading configuration…'),
+          error ? React.createElement('div', { style: styles.muted }, t('settings.error', { msg: error })) : React.createElement('div', { style: styles.muted }, t('settings.loading')),
         )
       }
 
@@ -287,20 +473,20 @@ return {
         const fields = CHANNEL_FIELDS[channel.key] || []
         return React.createElement('details', { key: channel.key, style: styles.details },
           React.createElement('summary', { style: styles.summary },
-            React.createElement('span', null, channel.label),
-            React.createElement('span', { style: styles.badge }, adapter.enabled ? 'enabled' : 'disabled'),
+            React.createElement('span', null, t(channel.label)),
+            React.createElement('span', { style: styles.badge }, adapter.enabled ? t('settings.enabled') : t('settings.disabled')),
           ),
           React.createElement('div', { style: styles.fieldGrid },
             React.createElement(Field, {
               key: 'enabled',
-              label: 'Enabled',
+              label: t('settings.enableField'),
               type: 'boolean',
               value: adapter.enabled,
               onChange: (value) => setPath(['adapters', channel.key, 'enabled'], value),
             }),
             fields.map((field) => React.createElement(Field, {
               key: field.key,
-              label: field.label,
+              label: t(field.label),
               type: field.type,
               options: field.options,
               value: adapter[field.key],
@@ -312,19 +498,19 @@ return {
 
       return React.createElement('div', { style: styles.form },
         React.createElement('div', { style: styles.formHeader },
-          React.createElement('h3', { style: styles.formTitle }, 'Message Channel Configuration'),
+          React.createElement('h3', { style: styles.formTitle }, t('settings.title')),
           React.createElement('div', { style: styles.formActions },
-            React.createElement('button', { style: styles.button, onClick: load }, 'Reload'),
-            React.createElement('button', { style: styles.primary, disabled: saving, onClick: save }, saving ? 'Saving…' : 'Save'),
+            React.createElement('button', { style: styles.button, onClick: load }, t('settings.reload')),
+            React.createElement('button', { style: styles.primary, disabled: saving, onClick: save }, saving ? t('settings.saving') : t('settings.save')),
           ),
         ),
-        error ? React.createElement('div', { style: styles.stateError }, 'Error: ' + error) : null,
+        error ? React.createElement('div', { style: styles.stateError }, t('settings.error', { msg: error })) : null,
         message ? React.createElement('div', { style: styles.stateRunning }, message) : null,
         React.createElement('details', { style: styles.details, open: true },
-          React.createElement('summary', { style: styles.summary }, 'General'),
+          React.createElement('summary', { style: styles.summary }, t('settings.general')),
           React.createElement('div', { style: styles.fieldGrid },
             React.createElement(Field, {
-              label: 'Workspace root',
+              label: t('settings.workspaceRoot'),
               type: 'text',
               value: config.workspaceRoot,
               onChange: (value) => setPath(['workspaceRoot'], value),
@@ -332,11 +518,11 @@ return {
           ),
         ),
         React.createElement('details', { style: styles.details },
-          React.createElement('summary', { style: styles.summary }, 'Runtime'),
+          React.createElement('summary', { style: styles.summary }, t('settings.runtime')),
           React.createElement('div', { style: styles.fieldGrid },
             RUNTIME_FIELDS.map((field) => React.createElement(Field, {
               key: field.key,
-              label: field.label,
+              label: t(field.label),
               type: field.type,
               value: config.runtime ? config.runtime[field.key] : null,
               onChange: (value) => setPath(['runtime', field.key], value),
@@ -344,11 +530,11 @@ return {
           ),
         ),
         React.createElement('details', { style: styles.details },
-          React.createElement('summary', { style: styles.summary }, 'Agent'),
+          React.createElement('summary', { style: styles.summary }, t('settings.agent')),
           React.createElement('div', { style: styles.fieldGrid },
             AGENT_FIELDS.map((field) => React.createElement(Field, {
               key: field.key,
-              label: field.label,
+              label: t(field.label),
               type: field.type,
               value: config.agent ? config.agent[field.key] : null,
               onChange: (value) => setPath(['agent', field.key], value),
@@ -356,11 +542,12 @@ return {
           ),
         ),
         CHANNELS.map(renderChannel),
-        React.createElement('div', { style: styles.notice }, 'Configuration is stored in .dsh-messaging/config.json and applies after Save.'),
+        React.createElement('div', { style: styles.notice }, t('settings.notice')),
       )
     }
 
     function MessagingPanel() {
+      useLocaleRefresh(ctx)
       const [data, setData] = React.useState(null)
       const [error, setError] = React.useState('')
       const [busy, setBusy] = React.useState(false)
@@ -413,10 +600,10 @@ return {
 
       return React.createElement('div', { style: styles.root },
         React.createElement('div', { style: styles.header },
-          React.createElement('h3', { style: styles.title }, 'dsh-messaging gateway'),
-          React.createElement('button', { style: styles.button, disabled: busy, onClick: reload }, busy ? 'Reloading…' : 'Reload'),
+          React.createElement('h3', { style: styles.title }, t('panel.title')),
+          React.createElement('button', { style: styles.button, disabled: busy, onClick: reload }, busy ? t('panel.reloading') : t('panel.reload')),
         ),
-        error ? React.createElement('div', { style: styles.muted }, 'Error: ' + error) : null,
+        error ? React.createElement('div', { style: styles.muted }, t('settings.error', { msg: error })) : null,
         data ? React.createElement('div', { style: styles.grid },
           (data.channels || []).map((channel) =>
             React.createElement('div', { key: channel.key, style: styles.card },
@@ -424,27 +611,27 @@ return {
                 React.createElement('span', { style: styles.name }, channel.label || channel.key),
                 React.createElement('span', { style: stateClass(channel.state) }, channel.state),
               ),
-              React.createElement('div', { style: styles.muted }, 'in ' + (channel.inboundCount || 0) + ' / out ' + (channel.outboundCount || 0)),
-              channel.lastError ? React.createElement('div', { style: styles.muted }, 'last error: ' + channel.lastError) : null,
+              React.createElement('div', { style: styles.muted }, t('panel.inOut', { in: channel.inboundCount || 0, out: channel.outboundCount || 0 })),
+              channel.lastError ? React.createElement('div', { style: styles.muted }, t('panel.lastError', { msg: channel.lastError })) : null,
             ),
           ),
         ) : null,
         data ? React.createElement('div', null,
-          React.createElement('div', { style: styles.section }, 'Sessions (' + (data.sessions || []).length + ')'),
+          React.createElement('div', { style: styles.section }, t('panel.sessions', { n: (data.sessions || []).length })),
           React.createElement('ul', { style: styles.list },
             (data.sessions || []).slice(0, 8).map((session) =>
               React.createElement('li', { key: session.key, style: styles.row },
-                session.channel + ' · ' + session.conversation + ' · msgs ' + session.messageCount,
+                t('panel.sessionRow', { channel: session.channel, conversation: session.conversation, n: session.messageCount }),
               ),
             ),
           ),
         ) : null,
         data ? React.createElement('div', null,
-          React.createElement('div', { style: styles.section }, 'Recent'),
+          React.createElement('div', { style: styles.section }, t('panel.recent')),
           React.createElement('ul', { style: styles.list },
             (data.recent || []).slice(-8).map((event, index) =>
               React.createElement('li', { key: event.at + '-' + index, style: styles.row },
-                event.kind + ' · ' + (event.channel || '-') + ' · ' + event.text,
+                t('panel.eventRow', { kind: event.kind, channel: event.channel || '-', text: event.text }),
               ),
             ),
           ),
@@ -462,7 +649,7 @@ return {
         name: 'settings.section',
         id: 'messaging',
         order: 25,
-        label: () => 'Messaging',
+        label: () => t('settings.title'),
       },
       MessagingSettingsSection,
     ))
