@@ -39,6 +39,9 @@ const fsService = {
 }
 
 const fakeShell = {
+  resolve(request) {
+    return request
+  },
   async run(request) {
     shellCalls.push(request)
     return {
