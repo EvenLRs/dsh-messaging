@@ -191,6 +191,17 @@ function ilinkHeaders(token) {
   return headers
 }
 
+// Lightweight headers for QR-status GET polls (no auth / no UIN; mirrors buildCommonHeaders).
+function ilinkCommonHeaders() {
+  return {
+    'iLink-App-Id': 'bot',
+    'iLink-App-ClientVersion': '65536',
+  }
+}
+
+// Fixed API base used for every QR code request (openclaw-weixin FIXED_BASE_URL).
+const ILINK_BASE_URL = 'https://ilinkai.weixin.qq.com'
+
 return {
   name: 'dsh-messaging',
   inject: ['webServer', 'shell', 'fs', 'agents', 'timer', 'agentDefaultModel'],
@@ -220,6 +231,7 @@ return {
       wechatPolling: false,
       wechatUpdatesBuf: '',
       wechatContextTokens: Object.create(null),
+      ilinkLogins: Object.create(null),
       discordProc: null,
     }
 
@@ -1263,6 +1275,115 @@ return {
         .join('')
     }
 
+    // --- ilink QR-code login (integrated from Tencent/openclaw-weixin src/auth/login-qr.ts) ---
+
+    const ILINK_LOGIN_TTL_MS = 5 * 60 * 1000
+
+    function purgeIlinkLogins() {
+      for (const key of Object.keys(state.ilinkLogins)) {
+        if (now() - state.ilinkLogins[key].startedAt > ILINK_LOGIN_TTL_MS) delete state.ilinkLogins[key]
+      }
+    }
+
+    async function fetchIlinkQrCode() {
+      const localTokens = []
+      const existingToken = state.config.adapters && state.config.adapters.wechat && state.config.adapters.wechat.token
+      if (existingToken) localTokens.push(existingToken)
+      const response = await httpPostJson(joinUrl(ILINK_BASE_URL, 'ilink/bot/get_bot_qrcode?bot_type=3'), { local_token_list: localTokens }, ilinkHeaders(''))
+      if (!response.ok || !response.json || !response.json.qrcode) {
+        throw new Error((response.json && response.json.errmsg) || response.stderr || ('HTTP ' + response.status))
+      }
+      return {
+        qrcode: String(response.json.qrcode),
+        qrcodeUrl: String(response.json.qrcode_img_content || ''),
+      }
+    }
+
+    async function startIlinkLogin() {
+      purgeIlinkLogins()
+      const qr = await fetchIlinkQrCode()
+      const sessionKey = 'ilink-' + now() + '-' + Math.floor(Math.random() * 1000000)
+      state.ilinkLogins[sessionKey] = {
+        qrcode: qr.qrcode,
+        qrcodeUrl: qr.qrcodeUrl,
+        startedAt: now(),
+        baseUrl: ILINK_BASE_URL,
+        pendingVerifyCode: undefined,
+      }
+      return {
+        ok: true,
+        sessionKey,
+        qrcodeUrl: qr.qrcodeUrl,
+        expiresAt: now() + ILINK_LOGIN_TTL_MS,
+      }
+    }
+
+    async function pollIlinkLoginStatus(sessionKey, verifyCode) {
+      const login = state.ilinkLogins[sessionKey]
+      if (!login) return { ok: false, error: 'no active login' }
+      if (now() - login.startedAt > ILINK_LOGIN_TTL_MS) {
+        delete state.ilinkLogins[sessionKey]
+        return { status: 'expired', final: true }
+      }
+      if (verifyCode) login.pendingVerifyCode = String(verifyCode)
+      let endpoint = 'ilink/bot/get_qrcode_status?qrcode=' + encodeURIComponent(login.qrcode)
+      if (login.pendingVerifyCode) endpoint += '&verify_code=' + encodeURIComponent(login.pendingVerifyCode)
+      const response = await httpGetJson(joinUrl(login.baseUrl, endpoint), ilinkCommonHeaders(), { timeoutMs: 40000 })
+      if (!response.ok) {
+        // Network/gateway error: treat as wait and let the client retry (mirrors openclaw-weixin).
+        return { status: 'wait' }
+      }
+      const body = response.json || {}
+      const status = body.status || 'wait'
+      if (status === 'confirmed') {
+        const botToken = body.bot_token
+        const botId = body.ilink_bot_id
+        if (!botToken || !botId) {
+          delete state.ilinkLogins[sessionKey]
+          return { status: 'failed', final: true, error: 'server did not return ilink_bot_id' }
+        }
+        const accountBase = body.baseurl ? trimTrailingSlash(String(body.baseurl)) : login.baseUrl
+        const wechatCfg = state.config.adapters.wechat
+        wechatCfg.token = String(botToken)
+        if (body.baseurl) wechatCfg.baseUrl = accountBase
+        await saveConfig(state.config)
+        delete state.ilinkLogins[sessionKey]
+        return {
+          status: 'confirmed',
+          final: true,
+          accountId: String(botId),
+          baseUrl: accountBase,
+          userId: body.ilink_user_id ? String(body.ilink_user_id) : null,
+        }
+      }
+      if (status === 'binded_redirect') {
+        // The scanned bot is already bound; existing credentials stay valid.
+        delete state.ilinkLogins[sessionKey]
+        return { status: 'confirmed', final: true, alreadyConnected: true }
+      }
+      if (status === 'scaned_but_redirect') {
+        if (body.redirect_host) login.baseUrl = 'https://' + String(body.redirect_host)
+        return { status: 'scaned' }
+      }
+      if (status === 'expired') {
+        try {
+          const fresh = await fetchIlinkQrCode()
+          login.qrcode = fresh.qrcode
+          login.qrcodeUrl = fresh.qrcodeUrl
+          login.startedAt = now()
+          login.pendingVerifyCode = undefined
+        } catch (error) {
+          return { status: 'failed', final: true, error: error.message }
+        }
+        return { status: 'expired', qrcodeUrl: login.qrcodeUrl }
+      }
+      if (status === 'verify_code_blocked') {
+        login.pendingVerifyCode = undefined
+        return { status: 'verify_code_blocked' }
+      }
+      return { status: status || 'wait' }
+    }
+
     async function startAdapter(def) {
       const cfg = state.config.adapters && state.config.adapters[def.key] ? state.config.adapters[def.key] : {}
       const status = channelStatus(def.key)
@@ -1326,6 +1447,7 @@ return {
       state.wechatSeen = Object.create(null)
       state.wechatUpdatesBuf = ''
       state.wechatContextTokens = Object.create(null)
+      state.ilinkLogins = Object.create(null)
     }
 
     async function rebuildAll(overrideConfig) {
@@ -1409,6 +1531,26 @@ return {
       }
       const result = await sendOutbound(args.channel, String(args.conversation), String(args.text), args.meta || {})
       return result
+    })
+    harness.handle('ilink_login_start', async () => {
+      try {
+        return await startIlinkLogin()
+      } catch (error) {
+        return { ok: false, error: error.message }
+      }
+    })
+    harness.handle('ilink_login_status', async (args) => {
+      return pollIlinkLoginStatus(args && args.sessionKey, args && args.verifyCode)
+    })
+    harness.handle('ilink_login_verify', async (args) => {
+      const login = args && args.sessionKey ? state.ilinkLogins[args.sessionKey] : null
+      if (!login) return { ok: false, error: 'no active login' }
+      login.pendingVerifyCode = String((args && args.verifyCode) || '')
+      return { ok: true }
+    })
+    harness.handle('ilink_login_cancel', async (args) => {
+      if (args && args.sessionKey) delete state.ilinkLogins[args.sessionKey]
+      return { ok: true }
     })
 
     ctx.effect(() => async () => {

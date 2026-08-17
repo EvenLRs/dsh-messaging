@@ -122,6 +122,21 @@ const LOCALE_DICTS = {
     'field.wechat.botAgent': '机器人标识（bot_agent）',
     'field.wechat.pollIntervalMs': '轮询间隔（毫秒）',
     'field.wechat.longPollTimeoutSec': '长轮询超时（秒）',
+    'wechat.login.title': '扫码登录',
+    'wechat.login.generate': '生成二维码',
+    'wechat.login.cancel': '取消',
+    'wechat.login.hint': '无需安装 openclaw，用手机微信扫码即可连接（与 Tencent/openclaw-weixin 同协议）。',
+    'wechat.login.wait': '等待扫码…',
+    'wechat.login.scaned': '已扫描，请在手机上确认…',
+    'wechat.login.needVerify': '请在手机上确认，并输入显示的配对数字：',
+    'wechat.login.verifyPlaceholder': '配对数字',
+    'wechat.login.verifySubmit': '提交',
+    'wechat.login.verifying': '正在验证…',
+    'wechat.login.expired': '二维码已过期，已自动刷新，请重新扫码。',
+    'wechat.login.confirmed': '登录成功，Token 已保存。',
+    'wechat.login.binded': '该账号此前已连接过，无需重复登录。',
+    'wechat.login.failed': '登录失败：{msg}',
+    'wechat.login.blocked': '配对数字多次错误，请重新扫码。',
   },
   en: {
     'channel.onebot': 'OneBot v11',
@@ -184,6 +199,21 @@ const LOCALE_DICTS = {
     'field.wechat.botAgent': 'Bot agent',
     'field.wechat.pollIntervalMs': 'Poll interval (ms)',
     'field.wechat.longPollTimeoutSec': 'Long-poll timeout (s)',
+    'wechat.login.title': 'QR code login',
+    'wechat.login.generate': 'Generate QR code',
+    'wechat.login.cancel': 'Cancel',
+    'wechat.login.hint': 'No OpenClaw installation needed — scan with WeChat to connect (same protocol as Tencent/openclaw-weixin).',
+    'wechat.login.wait': 'Waiting for scan…',
+    'wechat.login.scaned': 'Scanned — confirm on your phone…',
+    'wechat.login.needVerify': 'Confirm on your phone, then enter the pairing number:',
+    'wechat.login.verifyPlaceholder': 'Pairing number',
+    'wechat.login.verifySubmit': 'Submit',
+    'wechat.login.verifying': 'Verifying…',
+    'wechat.login.expired': 'QR expired — refreshed automatically, please scan again.',
+    'wechat.login.confirmed': 'Login successful, token saved.',
+    'wechat.login.binded': 'This account was already connected; no need to log in again.',
+    'wechat.login.failed': 'Login failed: {msg}',
+    'wechat.login.blocked': 'Pairing number rejected multiple times, please scan again.',
   },
 }
 
@@ -316,6 +346,28 @@ return {
       },
       toggle: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 2 },
       notice: { color: 'var(--color-muted, #777)' },
+      loginBox: {
+        border: '1px dashed var(--color-border, #d0d0d0)',
+        borderRadius: 8,
+        padding: 10,
+        marginTop: 10,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+      },
+      loginHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+      loginTitle: { fontWeight: 600 },
+      loginHint: { color: 'var(--color-muted, #777)', fontSize: 11 },
+      qrImage: {
+        width: 168,
+        height: 168,
+        imageRendering: 'pixelated',
+        border: '1px solid var(--color-border, #e1e1e1)',
+        borderRadius: 6,
+        background: '#fff',
+        alignSelf: 'center',
+      },
+      verifyRow: { display: 'flex', gap: 6, alignItems: 'center' },
     }
 
     function Field(props) {
@@ -357,6 +409,140 @@ return {
           },
           style: styles.input,
         }),
+      )
+    }
+
+    function WeChatLoginPanel(props) {
+      useLocaleRefresh(ctx)
+      const [sessionKey, setSessionKey] = React.useState(null)
+      const [qrUrl, setQrUrl] = React.useState('')
+      const [status, setStatus] = React.useState('idle')
+      const [verifyCode, setVerifyCode] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [error, setError] = React.useState('')
+      const [alreadyConnected, setAlreadyConnected] = React.useState(false)
+
+      const generate = async () => {
+        setBusy(true)
+        setError('')
+        setVerifyCode('')
+        setAlreadyConnected(false)
+        setStatus('wait')
+        try {
+          const result = await host.call('ilink_login_start')
+          if (!result || !result.ok) throw new Error((result && result.error) || 'login start failed')
+          setSessionKey(result.sessionKey)
+          setQrUrl(result.qrcodeUrl)
+        } catch (loginError) {
+          setStatus('failed')
+          setError(loginError && loginError.message ? loginError.message : String(loginError))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const cancel = async () => {
+        if (sessionKey) host.call('ilink_login_cancel', { sessionKey }).catch(() => {})
+        setSessionKey(null)
+        setQrUrl('')
+        setStatus('idle')
+        setVerifyCode('')
+        setAlreadyConnected(false)
+        setError('')
+      }
+
+      const submitVerify = async () => {
+        if (!sessionKey) return
+        setBusy(true)
+        setError('')
+        try {
+          await host.call('ilink_login_verify', { sessionKey, verifyCode })
+          setVerifyCode('')
+          setStatus('wait')
+        } catch (verifyError) {
+          setError(verifyError && verifyError.message ? verifyError.message : String(verifyError))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      React.useEffect(() => {
+        if (!sessionKey || !qrUrl) return
+        if (status !== 'wait' && status !== 'scaned') return
+        let alive = true
+        let timerDispose = null
+        const tick = async () => {
+          if (!alive) return
+          try {
+            const result = await host.call('ilink_login_status', { sessionKey })
+            if (!alive) return
+            if (!result) {
+              setStatus('failed')
+              setError('no response')
+              return
+            }
+            if (result.status === 'confirmed') {
+              setStatus('confirmed')
+              setAlreadyConnected(Boolean(result.alreadyConnected))
+              setQrUrl('')
+              if (props.onLoginSuccess) props.onLoginSuccess()
+              return
+            }
+            if (result.status === 'expired' && result.qrcodeUrl) setQrUrl(result.qrcodeUrl)
+            if (result.status === 'failed') {
+              setStatus('failed')
+              setError(result.error || 'login failed')
+              return
+            }
+            setStatus(result.status)
+            if (result.status === 'wait' || result.status === 'scaned') {
+              timerDispose = ctx.timeout(() => { if (alive) tick() }, 1000)
+            }
+          } catch (pollError) {
+            if (!alive) return
+            setStatus('failed')
+            setError(pollError && pollError.message ? pollError.message : String(pollError))
+          }
+        }
+        tick()
+        return () => {
+          alive = false
+          if (timerDispose) timerDispose()
+        }
+      }, [sessionKey, qrUrl, status])
+
+      const statusText = () => {
+        if (status === 'wait') return t('wechat.login.wait')
+        if (status === 'scaned') return t('wechat.login.scaned')
+        if (status === 'need_verifycode') return t('wechat.login.needVerify')
+        if (status === 'expired') return t('wechat.login.expired')
+        if (status === 'confirmed') return alreadyConnected ? t('wechat.login.binded') : t('wechat.login.confirmed')
+        if (status === 'verify_code_blocked') return t('wechat.login.blocked')
+        if (status === 'failed') return error ? t('wechat.login.failed', { msg: error }) : t('wechat.login.failed', { msg: 'unknown' })
+        return ''
+      }
+
+      return React.createElement('div', { style: styles.loginBox },
+        React.createElement('div', { style: styles.loginHeader },
+          React.createElement('span', { style: styles.loginTitle }, t('wechat.login.title')),
+          qrUrl
+            ? React.createElement('button', { style: styles.button, disabled: busy, onClick: cancel }, t('wechat.login.cancel'))
+            : React.createElement('button', { style: styles.button, disabled: busy, onClick: generate }, t('wechat.login.generate')),
+        ),
+        React.createElement('div', { style: styles.loginHint }, t('wechat.login.hint')),
+        qrUrl ? React.createElement('img', { src: qrUrl, style: styles.qrImage, alt: 'QR' }) : null,
+        statusText() ? React.createElement('div', { style: status === 'failed' ? styles.stateError : styles.muted }, statusText()) : null,
+        status === 'need_verifycode'
+          ? React.createElement('div', { style: styles.verifyRow },
+              React.createElement('input', {
+                style: styles.input,
+                value: verifyCode,
+                placeholder: t('wechat.login.verifyPlaceholder'),
+                onChange: (event) => setVerifyCode(event.target.value),
+              }),
+              React.createElement('button', { style: styles.primary, disabled: busy, onClick: submitVerify }, busy ? t('wechat.login.verifying') : t('wechat.login.verifySubmit')),
+            )
+          : null,
       )
     }
 
@@ -440,6 +626,9 @@ return {
               onChange: (value) => setPath(['adapters', channel.key, field.key], value),
             })),
           ),
+          channel.key === 'wechat'
+            ? React.createElement(WeChatLoginPanel, { onLoginSuccess: load })
+            : null,
         )
       }
 
