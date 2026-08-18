@@ -1,0 +1,40 @@
+{
+  "name": "dsh-messaging",
+  "version": "0.1.2",
+  "description": "DSH 消息渠道网关：自动注册并激活 dsh-messaging 动态 Cordis 插件",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EvenLRs/dsh-messaging.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis-plugin",
+    "messaging",
+    "onebot",
+    "telegram",
+    "discord",
+    "slack",
+    "lark",
+    "wecom",
+    "wechat"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "lib",
+    "dynamic",
+    "companion",
+    "config.example.json",
+    "cordis.patch.yml"
+  ]
+}

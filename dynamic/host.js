@@ -8,6 +8,10 @@ const CHANNEL_DEFS = [
   { key: 'wechat', label: 'Personal WeChat', kind: 'bridge' },
 ]
 
+// 配置根目录覆盖：启动壳会在注册前把本常量替换为用户主目录，
+// 使配置与伴随脚本固定落在 ~/.dsh-messaging/（手动粘贴运行时保持空串 = 自动探测）。
+const CONFIG_ROOT_OVERRIDE = ''
+
 // Agentless shell calls (curl HTTP, companion node scripts) cannot resolve a
 // per-session workspace-write ACL root; the deployment fallback root is not
 // always ACL-grantable, so these fixed-shape commands run unconfined.
@@ -314,6 +318,7 @@ return {
     }
 
     async function getFallbackRoot() {
+      if (CONFIG_ROOT_OVERRIDE) return CONFIG_ROOT_OVERRIDE
       const policy = ctx.get('sandboxPolicy')
       if (policy && typeof policy.workspaceRoot === 'string') return policy.workspaceRoot
       if (policy && typeof policy.resolve === 'function') {

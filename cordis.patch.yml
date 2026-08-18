@@ -1,0 +1,5 @@
+# 把 dsh-messaging 启动壳插入 web profile 的 host 插件层。
+# 壳在宿主启动后自动 cordis_define + 激活 dsh-messaging 动态插件（host+client 双半区）。
+- insert:
+    - id: dshmsg-boot
+      name: 'dsh-messaging'
