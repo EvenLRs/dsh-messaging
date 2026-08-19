@@ -97,6 +97,56 @@ async function main() {
       return output({ ok: true, json: plain.toString('utf8') })
     }
 
+    if (command === 'onebot' && op === 'verify') {
+      const secret = argValue('secret')
+      const signature = String(input.signature || '')
+      const rawBody = typeof input.rawBody === 'string' ? input.rawBody : ''
+      if (!secret || !signature) {
+        return output({ ok: false, error: 'missing required fields' })
+      }
+      const hmac = crypto.createHmac('sha1', secret).update(rawBody, 'utf8').digest('hex')
+      const expected = `sha1=${hmac}`
+      const sigBuf = Buffer.from(signature, 'utf8')
+      const expBuf = Buffer.from(expected, 'utf8')
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        return output({ ok: false, error: 'signature mismatch' })
+      }
+      return output({ ok: true })
+    }
+
+    if (command === 'slack' && op === 'verify') {
+      const signingSecret = argValue('signing-secret')
+      const timestamp = String(input.timestamp || '')
+      const signature = String(input.signature || '')
+      const rawBody = typeof input.rawBody === 'string' ? input.rawBody : ''
+      if (!signingSecret || !timestamp || !signature) {
+        return output({ ok: false, error: 'missing required fields' })
+      }
+      const nowSec = Math.floor(Date.now() / 1000)
+      const tsNum = Number(timestamp)
+      if (!Number.isFinite(tsNum) || Math.abs(nowSec - tsNum) > 300) {
+        return output({ ok: false, error: 'timestamp out of range' })
+      }
+      const sigBasestring = `v0:${timestamp}:${rawBody}`
+      const hmac = crypto.createHmac('sha256', signingSecret).update(sigBasestring, 'utf8').digest('hex')
+      const expected = `v0=${hmac}`
+      const sigBuf = Buffer.from(signature, 'utf8')
+      const expBuf = Buffer.from(expected, 'utf8')
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        return output({ ok: false, error: 'signature mismatch' })
+      }
+      return output({ ok: true })
+    }
+
+    if (command === 'timing-equal') {
+      const a = String(input.a || '')
+      const b = String(input.b || '')
+      const bufA = Buffer.from(a, 'utf8')
+      const bufB = Buffer.from(b, 'utf8')
+      const match = bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB)
+      return output({ ok: true, match })
+    }
+
     output({ ok: false, error: 'unknown command' })
   } catch (error) {
     output({ ok: false, error: error && error.message ? error.message : String(error) })
