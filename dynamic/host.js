@@ -67,6 +67,24 @@ function safeJsonParse(text, fallback) {
   }
 }
 
+function isApplicationJson(contentType) {
+  const ct = String(contentType || '').toLowerCase().trim()
+  return ct.startsWith('application/json')
+}
+
+function constantTimeEqual(a, b) {
+  const strA = String(a || '')
+  const strB = String(b || '')
+  let mismatch = strA.length === strB.length ? 0 : 1
+  const len = Math.max(strA.length, strB.length)
+  for (let i = 0; i < len; i++) {
+    const codeA = i < strA.length ? strA.charCodeAt(i) : 0
+    const codeB = i < strB.length ? strB.charCodeAt(i) : 0
+    mismatch |= codeA ^ codeB
+  }
+  return mismatch === 0
+}
+
 function trimTrailingSlash(value) {
   return String(value || '').replace(/[\\/]+$/, '')
 }
@@ -415,12 +433,12 @@ return {
       if (state.recent.length > 120) state.recent.splice(0, state.recent.length - 120)
     }
 
-    function recordError(channel, error, context) {
+    function recordError(channel, error, context, fatal = true) {
       const message = error instanceof Error ? error.message : String(error || 'unknown error')
       const status = channel ? channelStatus(channel) : null
       if (status) {
         status.lastError = message
-        if (status.state === 'starting' || status.state === 'running') status.state = 'error'
+        if (fatal && (status.state === 'starting' || status.state === 'running')) status.state = 'error'
       }
       state.errors.push(cleanJson({
         at: now(),
@@ -780,7 +798,29 @@ return {
       }
       disposers.push(registerRoute(path, async (req, res) => {
         if (req.method !== 'POST') return sendText(res, 405, 'method not allowed')
-        const body = safeJsonParse(await readBody(req, 4 * 1024 * 1024), null)
+        const contentType = req.headers && (req.headers['content-type'] || req.headers['Content-Type']) || ''
+        if (!isApplicationJson(contentType)) {
+          recordError('onebot', 'incoming webhook rejected: unsupported content-type', 'auth', false)
+          return sendText(res, 415, 'unsupported media type')
+        }
+        const rawBody = await readBody(req, 4 * 1024 * 1024)
+        if (rawBody === null) return sendJson(res, 400, { ok: false, error: 'invalid body' })
+        if (cfg.secret) {
+          const signature = req.headers && (req.headers['x-signature'] || req.headers['X-Signature']) || ''
+          if (!signature) {
+            recordError('onebot', 'incoming webhook rejected: missing X-Signature header', 'auth', false)
+            return sendJson(res, 401, { ok: false, error: 'unauthorized' })
+          }
+          const verifyRes = await companionRun('crypto-helper.cjs', ['onebot', 'verify', '--secret', cfg.secret], {
+            signature,
+            rawBody,
+          }, 15000)
+          if (!verifyRes || verifyRes.ok !== true) {
+            recordError('onebot', 'incoming webhook rejected: signature verification failed', 'auth', false)
+            return sendJson(res, 401, { ok: false, error: 'unauthorized' })
+          }
+        }
+        const body = safeJsonParse(rawBody, null)
         if (body && body.post_type === 'message') {
           const selfId = body.self_id
           const senderId = body.sender && body.sender.user_id
@@ -803,7 +843,7 @@ return {
         }
         sendJson(res, 200, { ok: true })
       }))
-      setChannelState('onebot', 'running', { webhookPath: path, endpoint: cfg.endpoint })
+      setChannelState('onebot', 'running', { webhookPath: path, endpoint: cfg.endpoint, auth: cfg.secret ? 'signature-verified' : 'unverified' })
       return disposers
     }
 
@@ -869,11 +909,28 @@ return {
       if (cfg.mode === 'webhook') {
         disposers.push(registerRoute(cfg.webhookPath || '/messaging/telegram/webhook', async (req, res) => {
           if (req.method !== 'POST') return sendText(res, 405, 'method not allowed')
+          const contentType = req.headers && (req.headers['content-type'] || req.headers['Content-Type']) || ''
+          if (!isApplicationJson(contentType)) {
+            recordError('telegram', 'incoming webhook rejected: unsupported content-type', 'auth', false)
+            return sendText(res, 415, 'unsupported media type')
+          }
+          if (!cfg.webhookSecret) {
+            recordError('telegram', 'incoming webhook rejected: webhookSecret is not configured', 'auth', false)
+            return sendJson(res, 401, { ok: false, error: 'unauthorized' })
+          }
+          const secretHeader = req.headers && (
+            req.headers['x-telegram-bot-api-secret-token'] ||
+            req.headers['X-Telegram-Bot-Api-Secret-Token']
+          ) || ''
+          if (!secretHeader || !constantTimeEqual(secretHeader, cfg.webhookSecret)) {
+            recordError('telegram', 'incoming webhook rejected: secret token mismatch', 'auth', false)
+            return sendJson(res, 401, { ok: false, error: 'unauthorized' })
+          }
           const body = safeJsonParse(await readBody(req, 4 * 1024 * 1024), null)
           if (body) processUpdate(body)
           sendJson(res, 200, { ok: true })
         }))
-        setChannelState('telegram', 'running', { mode: 'webhook', path: cfg.webhookPath || '/messaging/telegram/webhook' })
+        setChannelState('telegram', 'running', { mode: 'webhook', path: cfg.webhookPath || '/messaging/telegram/webhook', auth: cfg.webhookSecret ? 'secret-configured' : 'unprotected' })
       } else {
         if (cfg.dropPendingUpdates && state.telegramOffset === 0) {
           const dropped = await httpGetJson(telegramApi(cfg, 'getUpdates') + '?timeout=0&offset=-1', {}, { timeoutMs: 15000 })
@@ -987,7 +1044,33 @@ return {
       }
       disposers.push(registerRoute(path, async (req, res) => {
         if (req.method !== 'POST') return sendText(res, 405, 'method not allowed')
-        const body = safeJsonParse(await readBody(req, 2 * 1024 * 1024), null)
+        const contentType = req.headers && (req.headers['content-type'] || req.headers['Content-Type']) || ''
+        // Slack sends application/json, application/x-www-form-urlencoded (for shortcuts/interactivity)
+        if (!isApplicationJson(contentType) && !contentType.toLowerCase().startsWith('application/x-www-form-urlencoded')) {
+          recordError('slack', 'incoming webhook rejected: unsupported content-type', 'auth', false)
+          return sendText(res, 415, 'unsupported media type')
+        }
+        if (!cfg.signingSecret) {
+          recordError('slack', 'incoming webhook rejected: signingSecret is not configured', 'auth', false)
+          return sendJson(res, 401, { ok: false, error: 'unauthorized' })
+        }
+        const timestamp = req.headers && (req.headers['x-slack-request-timestamp'] || req.headers['X-Slack-Request-Timestamp']) || ''
+        const signature = req.headers && (req.headers['x-slack-signature'] || req.headers['X-Slack-Signature']) || ''
+        const rawBody = await readBody(req, 2 * 1024 * 1024)
+        if (!timestamp || !signature || rawBody === null) {
+          recordError('slack', 'incoming webhook rejected: missing signature or timestamp headers', 'auth', false)
+          return sendJson(res, 401, { ok: false, error: 'unauthorized' })
+        }
+        const verifyRes = await companionRun('crypto-helper.cjs', ['slack', 'verify', '--signing-secret', cfg.signingSecret], {
+          timestamp,
+          signature,
+          rawBody,
+        }, 15000)
+        if (!verifyRes || verifyRes.ok !== true) {
+          recordError('slack', 'incoming webhook rejected: signature verification failed', 'auth', false)
+          return sendJson(res, 401, { ok: false, error: 'unauthorized' })
+        }
+        const body = safeJsonParse(rawBody, null)
         if (!body) return sendJson(res, 400, { ok: false, error: 'invalid json' })
         if (body.type === 'url_verification') return sendJson(res, 200, { challenge: body.challenge })
         if (body.type === 'event_callback' && body.event) {
@@ -1047,27 +1130,44 @@ return {
       }
       disposers.push(registerRoute(path, async (req, res) => {
         if (req.method !== 'POST') return sendText(res, 405, 'method not allowed')
+        const contentType = req.headers && (req.headers['content-type'] || req.headers['Content-Type']) || ''
+        if (!isApplicationJson(contentType)) {
+          recordError('lark', 'incoming webhook rejected: unsupported content-type', 'auth', false)
+          return sendText(res, 415, 'unsupported media type')
+        }
         const body = safeJsonParse(await readBody(req, 2 * 1024 * 1024), null)
         if (!body) return sendJson(res, 400, { ok: false, error: 'invalid json' })
-        if (body.type === 'url_verification') return sendJson(res, 200, { challenge: body.challenge })
+        if (body.type === 'url_verification') return handleLarkEvent(cfg, body, res, false)
         if (body.encrypt) {
           try {
             const decrypted = await larkDecrypt(cfg, body.encrypt)
-            if (decrypted) return handleLarkEvent(cfg, decrypted, res)
+            if (decrypted) return handleLarkEvent(cfg, decrypted, res, true)
           } catch (error) {
-            return sendJson(res, 403, { ok: false, error: error.message })
+            return sendJson(res, 401, { ok: false, error: 'decrypt failed' })
           }
         }
-        return handleLarkEvent(cfg, body, res)
+        return handleLarkEvent(cfg, body, res, false)
       }))
       setChannelState('lark', 'running', { path, encrypted: Boolean(cfg.encryptKey) })
       return disposers
     }
 
-    function handleLarkEvent(cfg, event, res) {
-      if (cfg.verificationToken && event.token && event.token !== cfg.verificationToken) {
-        return sendJson(res, 403, { ok: false, error: 'bad token' })
+    function handleLarkEvent(cfg, event, res, wasEncrypted = false) {
+      if (cfg.verificationToken) {
+        if (!event || !event.token || !constantTimeEqual(event.token, cfg.verificationToken)) {
+          recordError('lark', 'incoming event rejected: verification token mismatch', 'auth', false)
+          return sendJson(res, 401, { ok: false, error: 'unauthorized' })
+        }
+      } else if (cfg.encryptKey) {
+        if (!wasEncrypted) {
+          recordError('lark', 'incoming event rejected: plain payload received while encryptKey configured without token', 'auth', false)
+          return sendJson(res, 401, { ok: false, error: 'unauthorized' })
+        }
+      } else {
+        recordError('lark', 'incoming event rejected: neither verificationToken nor encryptKey configured', 'auth', false)
+        return sendJson(res, 401, { ok: false, error: 'unauthorized' })
       }
+      if (event.type === 'url_verification') return sendJson(res, 200, { challenge: event.challenge })
       const callback = event.event || event
       if (callback.type === 'im.message.receive_v1') {
         const message = callback.message || {}

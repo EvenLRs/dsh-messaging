@@ -44,6 +44,26 @@ const fakeShell = {
   },
   async run(request) {
     shellCalls.push(request)
+    if (request.command.includes('crypto-helper.cjs')) {
+      const parts = request.command.split(/(?<!')\s+(?!')|\s+/)
+      const secretIndex = parts.indexOf("'--secret'") >= 0 ? parts.indexOf("'--secret'") : parts.indexOf('--secret')
+      const secretRaw = secretIndex >= 0 ? parts[secretIndex + 1] : ''
+      const secret = secretRaw.replace(/^'|'$/g, '').replace(/''/g, "'")
+      const input = JSON.parse(request.stdin || '{}')
+      const crypto = require('node:crypto')
+      const hmac = crypto.createHmac('sha1', secret).update(input.rawBody || '', 'utf8').digest('hex')
+      const expected = 'sha1=' + hmac
+      const match = input.signature === expected
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        aborted: false,
+        timeoutMs: request.timeoutMs || 60000,
+        stdout: { text: JSON.stringify(match ? { ok: true } : { ok: false, error: 'mismatch' }), truncated: false },
+        stderr: { text: '', truncated: false },
+      }
+    }
     return {
       exitCode: 0,
       signal: null,
@@ -139,18 +159,67 @@ async function main() {
   assert.equal(writtenFiles.size > 0, true, 'config should be written on first start')
   assert.equal(routes.has('/messaging/onebot'), true, 'onebot webhook should be registered')
 
+  // Set mock secret for onebot adapter
+  const config = await rpc.messaging_get_config()
+  config.config.adapters.onebot.secret = 'test-secret-456'
+  config.config.adapters.onebot.accessToken = 'test-token-789'
+  await rpc.messaging_set_config(config.config)
+  await tick()
+
   const onebotRoute = routes.get('/messaging/onebot')
-  const req = fakeRequest('POST', '/messaging/onebot', JSON.stringify({
+
+  const samplePayload = JSON.stringify({
     post_type: 'message',
     message_type: 'private',
     user_id: 1001,
     self_id: 999,
     raw_message: 'hello from smoke',
     sender: { user_id: 1001, nickname: 'smoke' },
-  }))
+  })
+
+  // 1. Negative assertion: Non-application/json content-type (e.g. text/plain CSRF attempt) -> 415
+  const csrfReq = fakeRequest('POST', '/messaging/onebot', samplePayload)
+  csrfReq.headers = { 'content-type': 'text/plain' }
+  const csrfRes = fakeResponse()
+  await onebotRoute(csrfReq, csrfRes)
+  await tick()
+  assert.equal(csrfRes.statusCode, 415, 'text/plain request must return 415 unsupported media type')
+  assert.equal(createdAgents.length, 0, 'no agent should be created for CSRF text/plain request')
+
+  // 2. Negative assertion: Missing X-Signature when secret is configured -> 401
+  const unauthReq = fakeRequest('POST', '/messaging/onebot', samplePayload)
+  unauthReq.headers = { 'content-type': 'application/json' }
+  const unauthRes = fakeResponse()
+  await onebotRoute(unauthReq, unauthRes)
+  await tick()
+  assert.equal(unauthRes.statusCode, 401, 'request without X-Signature must return 401')
+  assert.equal(createdAgents.length, 0, 'no agent should be created for unsigned request')
+
+  // 3. Negative assertion: Invalid X-Signature -> 401
+  const badReq = fakeRequest('POST', '/messaging/onebot', samplePayload)
+  badReq.headers = {
+    'content-type': 'application/json',
+    'x-signature': 'sha1=0000000000000000000000000000000000000000',
+  }
+  const badRes = fakeResponse()
+  await onebotRoute(badReq, badRes)
+  await tick()
+  assert.equal(badRes.statusCode, 401, 'request with bad X-Signature must return 401')
+  assert.equal(createdAgents.length, 0, 'no agent should be created for bad signature request')
+
+  // 4. Positive assertion: Valid X-Signature with application/json (fake-bot-server protocol)
+  const crypto = require('node:crypto')
+  const validHmac = crypto.createHmac('sha1', 'test-secret-456').update(samplePayload, 'utf8').digest('hex')
+  const req = fakeRequest('POST', '/messaging/onebot', samplePayload)
+  req.headers = {
+    'content-type': 'application/json',
+    'x-signature': 'sha1=' + validHmac,
+    'x-self-id': '999',
+  }
   const res = fakeResponse()
   await onebotRoute(req, res)
   await tick()
+  await new Promise((r) => setTimeout(r, 20))
 
   assert.equal(createdAgents.length, 1, 'one agent should be created for the inbound message')
   assert.equal(createdAgents[0].agent.messages.length, 1)

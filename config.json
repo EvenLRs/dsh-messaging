@@ -21,13 +21,15 @@
       "enabled": true,
       "endpoint": "http://127.0.0.1:5700",
       "accessToken": "",
+      "secret": "",
       "webhookPath": "/messaging/onebot",
-      "selfId": 999
+      "selfId": null
     },
     "telegram": {
       "enabled": false,
       "token": "",
       "mode": "polling",
+      "webhookSecret": "",
       "webhookPath": "/messaging/telegram/webhook",
       "pollIntervalMs": 2500,
       "longPollTimeoutSec": 40,
