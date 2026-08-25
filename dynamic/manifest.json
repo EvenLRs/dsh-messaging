@@ -1,9 +1,0 @@
-{
-  "name": "dsh-messaging",
-  "description": "Message gateway plugin for OneBot v11, Telegram, Discord, Slack, Lark, WeCom, and personal WeChat, with a Web UI settings page.",
-  "idPrefix": "dshmsg",
-  "platform": "both",
-  "hostSource": "./host.js",
-  "clientSource": "./client.js",
-  "configTemplate": "../config.example.json"
-}

@@ -1,21 +1,9 @@
-const fs = require('node:fs')
 const path = require('node:path')
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
+const { pathToFileURL } = require('node:url')
 
 const root = path.resolve(__dirname, '..')
-const hostSource = fs.readFileSync(path.join(root, 'dynamic', 'host.js'), 'utf8')
-
-const tools = {}
-const rpc = {}
-const harness = {
-  defineTool(tool) { return tool },
-  registerTool(_ctx, tool) { tools[tool.name] = tool; return () => {} },
-  handle(method, handler) { rpc[method] = handler; return () => {} },
-}
-
-const hostFactory = new Function('harness', hostSource)
-const plugin = hostFactory(harness)
 
 const routes = new Map()
 const listeners = new Map()
@@ -88,6 +76,7 @@ const fakeShell = {
 
 const ctx = {
   get(name) {
+    if (name === 'dshMessaging.root') return '/mock/workspace'
     if (name === 'sandboxPolicy') return { workspaceRoot: '/mock/workspace' }
     return undefined
   },
@@ -119,10 +108,12 @@ const ctx = {
   },
 }
 
-function fakeRequest(method, url, body) {
+function fakeRequest(method, url, body, headers) {
   const req = new EventEmitter()
   req.method = method
   req.url = url
+  req.headers = headers || {}
+  req.socket = { encrypted: false }
   req.destroy = () => {}
   queueMicrotask(() => {
     if (body) {
@@ -152,18 +143,51 @@ async function tick() {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
+function loopbackHeaders(extra) {
+  return Object.assign({
+    origin: 'http://127.0.0.1:3080',
+    host: '127.0.0.1:3080',
+  }, extra || {})
+}
+
+async function invoke(method, routePath, { body, headers } = {}) {
+  const handler = routes.get(routePath)
+  assert.ok(handler, 'missing route ' + routePath)
+  const req = fakeRequest(method, routePath, body, headers || loopbackHeaders())
+  const res = fakeResponse()
+  await handler(req, res)
+  await tick()
+  await tick()
+  let json = null
+  if (res.body) {
+    try { json = JSON.parse(res.body) } catch { json = res.body }
+  }
+  return { status: res.statusCode, json }
+}
+
 async function main() {
+  const plugin = await import(pathToFileURL(path.join(root, 'lib', 'index.js')).href)
   await plugin.apply(ctx)
   await tick()
 
   assert.equal(writtenFiles.size > 0, true, 'config should be written on first start')
   assert.equal(routes.has('/messaging/onebot'), true, 'onebot webhook should be registered')
+  assert.equal(typeof plugin.name, 'string')
+  assert.equal(plugin.name, 'dsh-messaging')
+  assert.ok(plugin.inject.includes('webServer'))
+  assert.ok(plugin.inject.includes('agents'))
 
   // Set mock secret for onebot adapter
-  const config = await rpc.messaging_get_config()
-  config.config.adapters.onebot.secret = 'test-secret-456'
-  config.config.adapters.onebot.accessToken = 'test-token-789'
-  await rpc.messaging_set_config(config.config)
+  const configRes = await invoke('GET', '/__dsh-messaging/config')
+  assert.equal(configRes.status, 200)
+  const config = configRes.json.config
+  config.adapters.onebot.secret = 'test-secret-456'
+  config.adapters.onebot.accessToken = 'test-token-789'
+  const saved = await invoke('POST', '/__dsh-messaging/config', {
+    body: JSON.stringify(config),
+    headers: loopbackHeaders({ 'content-type': 'application/json' }),
+  })
+  assert.equal(saved.status, 200)
   await tick()
 
   const onebotRoute = routes.get('/messaging/onebot')
@@ -240,18 +264,18 @@ async function main() {
   assert.equal(Boolean(outboundCurl), true, 'outbound reply should use curl')
   assert.equal(outboundCurl.command.includes('--data-binary'), true, 'outbound JSON body should be sent via curl stdin')
 
-  const status = await rpc.messaging_status()
+  const statusRes = await invoke('GET', '/__dsh-messaging/status')
+  assert.equal(statusRes.status, 200)
+  const status = statusRes.json
   const onebot = status.channels.find((channel) => channel.key === 'onebot')
   assert.equal(onebot.state, 'running')
   assert.equal(onebot.inboundCount, 1)
   assert.equal(onebot.outboundCount, 1)
   assert.equal(status.sessions.length, 1)
   assert.equal(status.sessions[0].conversation, 'private:1001')
-
-  const toolResult = await tools.messaging_status.execute({})
-  assert.equal(toolResult.channels.length, 7)
-  const configResult = await rpc.messaging_get_config()
-  assert.equal(configResult.config.adapters.onebot.enabled, true)
+  assert.equal(status.channels.length, 7)
+  const configResult = await invoke('GET', '/__dsh-messaging/config')
+  assert.equal(configResult.json.config.adapters.onebot.enabled, true)
 
   console.log('host-smoke: ok')
 }
