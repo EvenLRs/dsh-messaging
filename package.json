@@ -1,9 +1,14 @@
 {
   "name": "dsh-messaging",
   "version": "0.1.2",
-  "description": "DSH 消息渠道网关：自动注册并激活 dsh-messaging 动态 Cordis 插件",
+  "description": "DSH 消息渠道网关：静态 Host + 静态 Client 半区",
   "type": "module",
   "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -28,11 +33,19 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
     }
   },
   "files": [
     "lib",
-    "dynamic",
     "companion",
     "config.example.json",
     "cordis.patch.yml"
