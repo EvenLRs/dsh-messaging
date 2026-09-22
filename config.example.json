@@ -39,7 +39,7 @@
       "enabled": false,
       "botToken": "",
       "intents": 33281,
-      "wsModulePath": "/Applications/deeprein.app/Contents/Resources/_up_/backend/dsh/node_modules/ws"
+      "wsModulePath": ""
     },
     "slack": {
       "enabled": false,
