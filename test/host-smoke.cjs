@@ -171,13 +171,14 @@ async function main() {
   await tick()
 
   assert.equal(writtenFiles.size > 0, true, 'config should be written on first start')
-  assert.equal(routes.has('/messaging/onebot'), true, 'onebot webhook should be registered')
+  // Security fix: onebot webhook should NOT be registered without secret
+  assert.equal(routes.has('/messaging/onebot'), false, 'onebot webhook should not be registered without secret')
   assert.equal(typeof plugin.name, 'string')
   assert.equal(plugin.name, 'dsh-messaging')
   assert.ok(plugin.inject.includes('webServer'))
   assert.ok(plugin.inject.includes('agents'))
 
-  // Set mock secret for onebot adapter
+  // Set mock secret for onebot adapter and reload
   const configRes = await invoke('GET', '/__dsh-messaging/config')
   assert.equal(configRes.status, 200)
   const config = configRes.json.config
@@ -188,7 +189,16 @@ async function main() {
     headers: loopbackHeaders({ 'content-type': 'application/json' }),
   })
   assert.equal(saved.status, 200)
+
+  // Trigger reload to apply the new secret
+  const reloadRes = await invoke('POST', '/__dsh-messaging/reload', {
+    headers: loopbackHeaders({}),
+  })
+  assert.equal(reloadRes.status, 200)
   await tick()
+
+  // Now webhook should be registered with secret
+  assert.equal(routes.has('/messaging/onebot'), true, 'onebot webhook should be registered after secret is set')
 
   const onebotRoute = routes.get('/messaging/onebot')
 

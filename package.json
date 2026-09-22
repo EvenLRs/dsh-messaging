@@ -1,6 +1,6 @@
 {
   "name": "dsh-messaging",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "DSH 消息渠道网关：静态 Host + 静态 Client 半区",
   "type": "module",
   "main": "lib/index.js",
@@ -29,6 +29,12 @@
   ],
   "engines": {
     "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "scripts": {
+    "test": "node test/host-smoke.cjs && node test/http-routes.cjs && node test/client-smoke.cjs"
   },
   "dsh": {
     "bundle": {
