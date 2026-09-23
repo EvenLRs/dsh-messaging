@@ -8,6 +8,10 @@ const root = path.resolve(__dirname, '..')
 
 const routes = new Map()
 const writtenFiles = new Map()
+// Every writeText policy argument, in call order. The config file sits outside a
+// session's workspace ACL root, so an omitted policy lets the FsSandbox fall back
+// to the session's workspace-write and refuse the settings page's save.
+const writePolicies = []
 
 const ctx = {
   get(name) {
@@ -52,7 +56,8 @@ const ctx = {
       error.code = 'FS_NOT_FOUND'
       throw error
     },
-    async writeText(target, content) {
+    async writeText(target, content, expected, signal, sandboxPolicy) {
+      writePolicies.push(sandboxPolicy)
       writtenFiles.set(target.displayPath, content)
       return { version: 'v1' }
     },
@@ -139,14 +144,28 @@ async function main() {
   const denied = [
     await invoke('GET', '/__dsh-messaging/status', { headers: { origin: 'http://evil.example', host: '127.0.0.1:3080' } }),
     await invoke('GET', '/__dsh-messaging/status', { headers: { origin: 'http://127.0.0.1:3080', host: 'evil.example' } }),
-    await invoke('GET', '/__dsh-messaging/status', { headers: { host: '127.0.0.1:3080' } }),
+    await invoke('GET', '/__dsh-messaging/status', { headers: { host: 'evil.example' } }),
     await invoke('GET', '/__dsh-messaging/status', { headers: { origin: 'https://127.0.0.1:3080', host: '127.0.0.1:3080' } }),
+    // A cross-site read carries a loopback Host but is still refused outright.
+    await invoke('GET', '/__dsh-messaging/status', {
+      headers: { host: '127.0.0.1:3080', 'sec-fetch-site': 'cross-site' },
+    }),
   ]
   for (const result of denied) {
     assert.equal(result.status, 403)
     assert.equal(result.json.ok, false)
     assert.equal(result.json.error, 'forbidden origin')
   }
+
+  // A same-origin read from a loopback page carries no Origin at all, and the
+  // Electron shell's CORS-mode fetch carries neither Origin nor Referer: both
+  // are far less suspicious than any other origin, so the fence admits them on
+  // the Host it already verified, exactly as DSH's own /api fence does.
+  const noMarkers = await invoke('GET', '/__dsh-messaging/status', {
+    headers: { host: '127.0.0.1:3080', 'sec-fetch-mode': 'cors' },
+  })
+  assert.equal(noMarkers.status, 200, 'a header-less loopback GET must be accepted')
+  assert.equal(noMarkers.json.channels.length, 7)
 
   const status = await invoke('GET', '/__dsh-messaging/status', { headers: loopbackHeaders() })
   assert.equal(status.status, 200)
@@ -177,6 +196,13 @@ async function main() {
   })
   assert.equal(refererOnly.status, 200)
 
+  // A default port is not part of the authority: the browser omits it from
+  // Origin while Host may still spell it, so the two must compare equal.
+  const defaultPortHost = await invoke('GET', '/__dsh-messaging/status', {
+    headers: { origin: 'http://127.0.0.1', host: '127.0.0.1:80' },
+  })
+  assert.equal(defaultPortHost.status, 200, 'http://host:80 and http://host are the same authority')
+
   const nextConfig = JSON.parse(JSON.stringify(config.json.config))
   nextConfig.adapters.onebot.enabled = false
   const saved = await invoke('POST', '/__dsh-messaging/config', {
@@ -186,6 +212,15 @@ async function main() {
   assert.equal(saved.status, 200)
   const onebot = saved.json.channels.find((channel) => channel.key === 'onebot')
   assert.equal(onebot.enabled, false)
+
+  assert.ok(writePolicies.length > 0, 'config save must write the config file')
+  for (const policy of writePolicies) {
+    assert.equal(
+      policy && policy.mode,
+      'danger-full-access',
+      'config write must carry its own policy; an omitted one is refused under workspace-write',
+    )
+  }
 
   const reloaded = await invoke('POST', '/__dsh-messaging/reload', {
     headers: loopbackHeaders(),
