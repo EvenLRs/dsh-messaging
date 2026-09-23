@@ -1,3 +1,10 @@
 # Local documentation only; do not publish to the GitHub repository.
 PLAN.md
 README.md
+
+# Installed dependencies must never be committed.
+node_modules/
+
+# Local-only artifacts: not part of the published package.
+package-lock.json
+verify-lark.ps1
