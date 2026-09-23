@@ -166,11 +166,14 @@ async function flush() {
 
 async function main() {
   const calls = []
+  const cloneDeep = (value) => JSON.parse(JSON.stringify(value))
+  // Mutable so a test can render the same section under a different lark mode.
+  let configFixture = fixtureConfig
   const fetchImpl = (url, opts) => {
     calls.push({ url: String(url), method: (opts && opts.method) || 'GET', opts })
     let body = { ok: true }
     if (String(url).endsWith('/config') && (!opts || opts.method === 'GET' || !opts.method)) {
-      body = { config: fixtureConfig }
+      body = { config: configFixture }
     } else if (String(url).endsWith('/status')) {
       body = { channels: [], sessions: [], recent: [], errors: [] }
     }
@@ -203,6 +206,47 @@ async function main() {
   assert.equal(section.options.order, 25)
   assert.equal(section.options.label(), 'Message Channel Configuration')
   assert.ok(panel, 'tool.view.cordis registration should still exist')
+
+  // Lark credentials are user-supplied in webhook mode and must match the Feishu
+  // console, so they are editable fields — but hidden while the default long
+  // connection mode is in force, since that mode needs none of them.
+  assert.match(clientSource, /key: 'verificationToken', label: 'field\.lark\.verificationToken'/, 'the verification token field must be declared')
+  assert.match(clientSource, /key: 'encryptKey', label: 'field\.lark\.encryptKey'/, 'the encrypt key field must be declared')
+  assert.match(clientSource, /webhookOnly: true/, 'the webhook credential fields must be marked webhook-only')
+  assert.match(clientSource, /adapter\.mode === 'webhook'/, 'the webhook-only fields must be gated on the mode')
+  assert.match(clientSource, /LarkSetupPanel/, 'the per-mode guidance panel should be registered')
+  // No generated-token display machinery may remain after the revert.
+  assert.doesNotMatch(clientSource, /readOnly: true/)
+  assert.doesNotMatch(clientSource, /lark\.setup\.tokenLabel/)
+
+  // The webhook-only fields must actually disappear under the default mode: count the
+  // lark channel's inputs in each mode and expect exactly the three gated fields.
+  const larkInputCount = async (mode) => {
+    configFixture = cloneDeep(fixtureConfig)
+    configFixture.adapters.lark = Object.assign({}, configFixture.adapters.lark, { enabled: true, mode })
+    React.resetCursor()
+    render(section.component, {})
+    await flush()
+    React.resetCursor()
+    const rendered = render(section.component, {})
+    let count = 0
+    const walk = (node, insideLark) => {
+      if (!node || typeof node !== 'object') return
+      if (Array.isArray(node)) return node.forEach((child) => walk(child, insideLark))
+      const inLark = insideLark || (node.type === 'details' && node.props && node.props.key === 'lark')
+      if (inLark && node.type === 'input') count += 1
+      const kids = []
+      if (node.props && node.props.children != null) kids.push(node.props.children)
+      if (node.children) kids.push(...[].concat(node.children))
+      kids.forEach((child) => walk(child, inLark))
+    }
+    walk(rendered, false)
+    return count
+  }
+  const longConnInputs = await larkInputCount('long-connection')
+  const webhookInputs = await larkInputCount('webhook')
+  assert.equal(webhookInputs - longConnInputs, 3, 'the three webhook-only lark fields must be hidden in long connection mode')
+  configFixture = fixtureConfig
 
   React.resetCursor()
   let tree = render(section.component, {})
