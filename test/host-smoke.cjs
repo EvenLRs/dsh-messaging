@@ -1,12 +1,19 @@
 const path = require('node:path')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
 const { EventEmitter } = require('node:events')
 const { pathToFileURL } = require('node:url')
 
 const root = path.resolve(__dirname, '..')
 
+// 隔离的 DSH 宿主存储根：入站会触发会话 id 惰性迁移的存在性探测，绝不能指向真实家目录。
+const fixtureDshHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mig-home-'))
+
 const routes = new Map()
 const listeners = new Map()
+// 每个 ctx.effect 注册的清理函数；生命周期测试按逆序执行它们以模拟 fiber 停用。
+const effectDisposers = []
 const shellCalls = []
 const writtenFiles = new Map()
 const createdAgents = []
@@ -113,13 +120,23 @@ const ctx = {
     if (name === 'dshMessaging.root') return '/mock/workspace'
     if (name === 'sandboxPolicy') return { workspaceRoot: '/mock/workspace' }
     if (name === 'dshMessaging.larkSdk') return fakeLarkSdk
+    if (name === 'dsh.home') return fixtureDshHome
     return undefined
   },
   on(name, listener) { listeners[name] = listener; return () => {} },
-  effect() { return () => {} },
+  effect(fn) {
+    const dispose = fn()
+    effectDisposers.push(dispose)
+    return dispose
+  },
   interval() { return () => {} },
   webServer: {
     register(route) {
+      // 与真实 dsh-host-webserver 一致：exact 路由重复注册必须抛错。
+      // 停用时不注销（disposer 被丢弃）的回归会在这里立刻炸出来。
+      if (routes.has(route.path)) {
+        throw new Error('webserver: duplicate exact route "' + route.path + '"')
+      }
       routes.set(route.path, route.handler)
       return () => routes.delete(route.path)
     },
@@ -220,13 +237,7 @@ async function channelStatus(key) {
   return status.json.channels.find((channel) => channel.key === key)
 }
 
-// Mirrors the plugin's session id derivation so a test can predict it from a key.
-function safeId(channel, conversation) {
-  const key = conversation.startsWith(channel + ':') ? conversation : channel + ':' + conversation
-  const cleaned = key.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80)
-  return 'dsh-msg-' + cleaned
-}
-
+// 会话 id 派生不再本地镜像：直接用被测模块的真实实现（带键哈希的防碰撞方案）。
 function loopbackHeaders(extra) {
   return Object.assign({
     origin: 'http://127.0.0.1:3080',
@@ -251,6 +262,7 @@ async function invoke(method, routePath, { body, headers } = {}) {
 
 async function main() {
   const plugin = await import(pathToFileURL(path.join(root, 'lib', 'index.js')).href)
+  const { sessionIdForKey } = await import(pathToFileURL(path.join(root, 'lib', 'session-id-migration.js')).href)
   await plugin.apply(ctx)
   await tick()
 
@@ -551,7 +563,7 @@ async function main() {
   // the durable DSH session stays on disk. The next message must RESUME that session:
   // re-issuing `create` for the same id rejects with SessionAlreadyExistsError, which
   // would silently drop the message.
-  const wsSessionId = safeId('lark', 'lark:oc_ws')
+  const wsSessionId = sessionIdForKey('lark:oc_ws')
   assert.equal(persistedSessions.has(wsSessionId), true, 'the ws session was created durably')
   const resumedBefore = resumedAgents.length
   const createdBefore = createdAgents.length
@@ -594,6 +606,24 @@ async function main() {
   assert.equal(ws.closed, true, 'disabling the adapter must close the long connection')
 
 
+  // 生命周期回归：UI 路由必须随 fiber 注销。真实 webServer 对 exact 重复注册会抛错
+  // （上面的 mock 已对齐），因此「停用不注销 → 再启用必撞 duplicate exact route」
+  // 会在这里以二次 apply 抛错的形式暴露——这正是真机上 disable→enable 后插件
+  // 在本进程内永久无法激活的缺陷。
+  assert.equal(routes.has('/__dsh-messaging/status'), true, 'UI route registered while active')
+  assert.equal(routes.has('/messaging/onebot'), true, 'onebot webhook registered while active')
+  for (const dispose of effectDisposers.slice().reverse()) {
+    if (typeof dispose === 'function') await dispose()
+  }
+  assert.equal(routes.has('/__dsh-messaging/status'), false, 'UI routes must be disposed with the plugin fiber')
+  assert.equal(routes.has('/__dsh-messaging/ilink/login/start'), false, 'every UI route must be disposed')
+  assert.equal(routes.has('/messaging/onebot'), false, 'webhook routes are disposed via disposeAdapters')
+  await plugin.apply(ctx) // 二次激活（等价 disable→enable）：不得再撞 duplicate exact route
+  await tick()
+  assert.equal(routes.has('/__dsh-messaging/status'), true, 're-apply must re-register the UI routes')
+  assert.equal(routes.has('/__dsh-messaging/ilink/login/start'), true, 'all UI routes return after re-apply')
+
+  fs.rmSync(fixtureDshHome, { recursive: true, force: true })
   console.log('host-smoke: ok')
 }
 

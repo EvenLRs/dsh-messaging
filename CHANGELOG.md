@@ -1,5 +1,78 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **会话 id 防碰撞（新方案 `dsh-msg-<slug>-x<键哈希>`）与旧存储分级迁移。** 旧方案只做
+  slug（小写、非 `[a-z0-9]`→`-`、截 80 字符），存在三类**实测**碰撞：telegram 负数群 id
+  `-100123456` 与正数 uid `100123456`、下划线与连字符归一（`oc_abc`/`oc-abc`）、超长截断。
+  碰撞后两个不同 IM 会话会**错误整合进同一个 DSH 会话**（历史互相污染），且后创建者覆盖
+  `sessionToConversation`，两个会话的回复都会发给后一个 conversation（前者的回复丢失/串会话）。
+  现在 slug 后附加原会话键的 32 位哈希后缀（`lib/session-id-migration.js`）：可读性保留，
+  键级唯一。磁盘上现有三个插件会话均未碰撞，但风险是结构性的，本次连同迁移一并消除。
+- **双前缀旧会话历史不再与新会话分裂。** `dsh-msg-lark-lark-oc-…`（双前缀修复前产生、
+  含历史、且已被归档）与按新键派生的 id 不同，该会话下次发言会落新 id、旧历史成孤儿。
+  现在 `ensureAgent` 在按新键 resume 之前，用**适配器权威给出的会话键**列出旧形态候选
+  （顺序 = 纯 slug 形态在前、双前缀形态在后），命中就把整个会话存储（日志目录 + zstd 头部
+  内嵌 id + projcache + workspace 注册表引用）迁到新 id 再续接——历史无缝合并。
+  迁移**不从盘上 id 反推会话键**（slug 不可逆：`:`/`-`/`_` 归一、大小写、截断），
+  因此惰性路径是权威路径；键不明的会话（如个人微信，分隔符归一存在歧义）会在其首条
+  消息到来时按真实键正确迁移。
+- **出站 `sendmessage`：成功误判 + 信封缺字段导致「网关收下但手机不显示」（两个叠加根因）。**
+  ① 判据：成功返回 `{message_id}` **没有 `ret` 字段**（实测），旧判据 `ret === 0` 把成功
+  判失败、兜底错误恰为 `'HTTP 200'`；现成功 = `ret === 0` **或** `message_id` 为数字，
+  失败错误附带响应体预览。② 载荷：对照两份独立参考实现
+  （openclaw-weixin `src/messaging/send.ts` 与 photon-hq/wechat-ilink-client，
+  双源一致、枚举 `types.ts` 双源核对），旧载荷缺 `from_user_id: ''`、`client_id`、
+  `message_type: BOT(2)`、`message_state: FINISH(2)` —— 网关照样返回 `message_id`
+  但**不作为机器人完成消息投递，手机端永远看不到**（用户实测「回复没到手机」的根因）。
+  现按参考实现的完整信封发送；`login-qr-route` 捕获 stdin 并逐字段断言信封
+  （含 client_id 形态与去前缀的 to_user_id）。另注：HMR 不热载本插件、`/reload`
+  只重建适配器不重 import ——修复代码需 plugin_manager 停用→启用（生命周期修复后
+  可用）或重启 DSH 才生效。
+- **会话日志多帧数据丢失事故与帧感知修复（严重，已从备份恢复）。** 会话日志是
+  **多帧追加的 zstd**（首帧=头、后续帧=消息批次），而 Node `zstdDecompressSync`
+  **只解第一帧**（实测：多帧输入仅返回首帧内容）。迁移的 id 改写原先整文件解压→
+  替换→重写，结果**清空了首帧之后的全部消息帧**：lark 两份日志被压成仅含头部的
+  180B（24 行 / 18 行历史全部丢失），个人微信日志在惰性迁移时同样被截断（其后宿主
+  又追加了新帧，迁移前的 16 小时前往事仅存于执行前备份）——用户实测「没有继承
+  16 小时前对话的 session」即此因（resume 成功但日志无历史，agent 回 "N"）。
+  另一层原因：当时的完整性校验用整文件解压对比，**两侧同盲区**得到假阳性
+  "IDENTICAL"。现修复为**帧感知**：移植 harness `scanZstdFrames` 的规范解析
+  （魔数/帧头描述符/块位域），只解压**含 id token 的帧**，其余帧字节原样保留
+  （校验和不破坏），帧数恒定；撕裂/损坏帧在**任何改名之前**整体中止
+  （`torn-log`/`corrupt-log`），绝不产出半途状态。三份日志已用执行前备份按帧感知
+  改写恢复（wechat 放弃其两条一次性当日测试轮以避免两段 seq 0..16 / 0..25 重叠，
+  其陈旧 projcache 删除强制重建）；新增多帧保真 + 撕裂中止回归用例。
+
+### Added
+
+- **插件停用/启用生命周期修复（真机 disable→enable 触发）。** UI 路由
+  （`/__dsh-messaging/*`）原先注册后丢弃 disposer、未绑定 fiber 清理：停用插件时
+  路由永久残留在进程级 webServer 注册表，**再次启用会在首条注册撞
+  `duplicate exact route`，插件在该进程内永久无法激活**。现在每条 UI 路由经
+  `ctx.effect(() => dispose)` 随 fiber 注销；host-smoke 的 webServer mock 已对齐
+  真实行为（重复注册抛错）并新增「停用注销 → 二次 apply 无撞」生命周期用例。
+  已确认适配器 webhook 路由本就正确入 `disposers`，无此问题。
+- `scripts/migrate-sessions.cjs`：**分级**迁移/清理工具，对应三类存量数据操作：
+  - `--stage ids`（防碰撞方案落地）：纯 slug 旧 id → 新 id；
+  - `--stage legacy`（双前缀历史归并）：双前缀旧 id → 新 id；
+  - `--stage cleanup`：删除 0.1.x 动态壳遗留的 `dsh-messaging-bootstrap` 孤儿会话
+    （仅它自己的日志目录 + projcache 两件套）。
+  默认 dry-run（只打印计划），`--apply` 才执行；全部幂等可重跑；**同件存储源/目标并存**
+  （真分歧）时整体 `target-exists` 跳过——绝不合并、绝不覆盖、绝不删除；跨件半途态
+  （目录已改名、头部/缓存未搬，即崩溃恢复）会续跑补完。
+  替换用 JSON 引号定界的整体 token 匹配：新 id = 旧 id + 后缀，裸子串替换会在重跑时
+  命中新 id 内部把数据改坏（该缺陷由本批测试捕获）。
+- `test/session-id-migration.cjs`：九组用例——碰撞对分离、候选顺序（第二点在前第一点在后）、
+  dry-run 零改动、stage ids 完整搬运（zstd 头部重写 + projcache 改名/内容修补 + 注册表引用）、
+  幂等重跑 absent、同件冲突双向（目录/projcache）源保全、崩溃续跑补完、cleanup 只删
+  bootstrap 两件套且幂等、CLI 参数解析。`npm test` 现为**七项**；host-smoke 改为导入
+  真实 id 派生（删除本地镜像）并以 `ctx.get('dsh.home')` 注入隔离的**会话存储根**，
+  测试的迁移探测绝不触碰真实 `~/.dsh` 会话数据（`~/.dsh-messaging` 配置/伴随脚本的
+  既有预置行为不在本次变更范围）。
+
 ## 0.2.0
 
 纯静态插件架构。设置页随 DSH Web profile 启动自动出现。本版包含静态化迁移与
