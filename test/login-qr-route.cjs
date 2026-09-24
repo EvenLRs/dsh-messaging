@@ -15,7 +15,9 @@ const writtenFiles = new Map()
 
 // 网关脚本：按 shell 命令里的端点分流，可在用例间切换。
 const gateway = {
-  qr: 'ok', // 'ok' | 'fail'
+  qr: 'ok', // 'ok' | 'fail' | 'no-payload'
+  send: '{"message_id":987654321}', // sendmessage 响应体；成功形状**无 ret 字段**（实测）
+  lastSendPayload: null, // 捕获的 sendmessage 请求体（stdin），用于断言信封字段
   statusSequence: ['wait'], // 每次 get_qrcode_status 依次消费，最后一个重复
   statusCalls: 0,
   qrCalls: 0,
@@ -46,6 +48,15 @@ function gatewayStdout(request) {
     const idx = Math.min(gateway.statusCalls - 1, seq.length - 1)
     const status = seq[idx]
     return JSON.stringify({ status }) + '\n__DSH_STATUS__:200'
+  }
+  if (command.includes('sendmessage')) {
+    try { gateway.lastSendPayload = JSON.parse(String(request.stdin || 'null')) } catch { gateway.lastSendPayload = null }
+    return gateway.send + '\n__DSH_STATUS__:200'
+  }
+  if (command.includes('getupdates')) {
+    // 让长轮询循环**单次即退出**：mock 的 shell 瞬时解析会让 while 循环变成
+    // 微任务风暴、饿死事件循环（启用 wechat 适配器后 suite 曾整体挂死）。
+    return '\n__DSH_STATUS__:500'
   }
   return '\n__DSH_STATUS__:200'
 }
@@ -217,6 +228,52 @@ async function main() {
   })
   assert.equal(after.json.ok, false)
   assert.equal(after.json.error, 'no active login')
+
+  // 6.5) 启用 wechat 适配器（默认 disabled；出站用例要求 adapter 就绪，
+  //      否则 sendOutbound 以 'adapter not ready' 失败——这正是 case7 首跑失败的原因）
+  const cfgBefore = await invoke('GET', '/__dsh-messaging/config')
+  const cfg = cfgBefore.json.config
+  cfg.adapters.wechat.enabled = true
+  const cfgSaved = await invoke('POST', '/__dsh-messaging/config', { body: JSON.stringify(cfg) })
+  assert.equal(cfgSaved.status, 200, 'config save must succeed')
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // 7) 出站成功形状：sendmessage 返回 {message_id}（**无 ret 字段**，实测网关如此）。
+  //    旧判据 ret===0 把成功判成失败、错误串恰为 'HTTP 200'——回复被误报未送达。
+  gateway.send = '{"message_id":987654321}'
+  const sendOk = await invoke('POST', '/__dsh-messaging/send', {
+    body: JSON.stringify({ channel: 'wechat', conversation: 'wechat:tester', text: 'hello' }),
+  })
+  assert.equal(sendOk.json.ok, true, 'message_id 形状必须判成功')
+  assert.equal(sendOk.json.error, null, '成功不得带错误')
+  // 出站信封必须与参考实现一致（openclaw-weixin / wechat-ilink-client 双源）：
+  // 缺 message_type/message_state/client_id 时网关返回 message_id 但手机端不显示。
+  const sent = gateway.lastSendPayload && gateway.lastSendPayload.msg
+  assert.ok(sent, 'send payload must be captured from stdin')
+  assert.equal(sent.from_user_id, '', 'from_user_id must be explicit empty string')
+  assert.equal(sent.message_type, 2, 'message_type must be BOT(2)')
+  assert.equal(sent.message_state, 2, 'message_state must be FINISH(2)')
+  assert.match(String(sent.client_id), /^dsh-messaging-[0-9a-f]{16}$/, 'client_id must be a unique id')
+  assert.equal(sent.to_user_id, 'wechat:tester'.replace(/^wechat:/, ''), 'to_user_id strips the channel prefix')
+  assert.equal(sent.item_list[0].type, 1, 'text item type')
+  assert.equal(sent.item_list[0].text_item.text, 'hello')
+
+  // 8) 真失败：ret 非 0 → 透传 errmsg
+  gateway.send = '{"ret":7,"errmsg":"boom"}'
+  const sendFail = await invoke('POST', '/__dsh-messaging/send', {
+    body: JSON.stringify({ channel: 'wechat', conversation: 'wechat:tester', text: 'x' }),
+  })
+  assert.equal(sendFail.json.ok, false)
+  assert.equal(sendFail.json.error, 'boom', 'errmsg 必须透传')
+
+  // 9) 不可判定形状 → 失败且错误带 body 预览（诊断性，不再只有裸 'HTTP 200'）
+  gateway.send = '{"foo":1}'
+  const sendWeird = await invoke('POST', '/__dsh-messaging/send', {
+    body: JSON.stringify({ channel: 'wechat', conversation: 'wechat:tester', text: 'x' }),
+  })
+  assert.equal(sendWeird.json.ok, false)
+  assert.match(String(sendWeird.json.error), /^HTTP 200 body=/, '错误必须携带响应体预览')
 
   console.log('login-qr-route: ok')
 }
