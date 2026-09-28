@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
+
+会话 id 防碰撞与分级迁移、dsh-shell 双代际适配（修复安装版运行时下全部 shell HTTP）、
+飞书/微信出站信封与成功判据、多帧日志帧感知修复、插件停用/启用生命周期修复。
 
 ### Fixed
 
@@ -45,6 +48,23 @@
   （`torn-log`/`corrupt-log`），绝不产出半途状态。三份日志已用执行前备份按帧感知
   改写恢复（wechat 放弃其两条一次性当日测试轮以避免两段 seq 0..16 / 0..25 重叠，
   其陈旧 projcache 删除强制重建）；新增多帧保真 + 撕裂中止回归用例。
+- **适配 dsh-shell 双代际契约（修复安装版运行时下全部 shell HTTP 崩溃）。** 本机
+  安装版 DSH（`dsh-shell@0.1.7-rc.2`，自 app.asar 实证）的 `ctx.shell` 已是**句柄
+  代际**：`execute(spec)` 立即返回统一句柄，前台 = `await handle.result()`
+  （字段与旧 run 同名同义：exitCode/signal/timedOut/aborted/timeoutMs/
+  stdout|stderr:{text,truncated}），后台 = 保留句柄（readOutput/kill/done 与旧
+  ShellProcess 同表面），`run`/`start` 不复存在。插件只认 `run/start` → **所有经
+  shell curl 的 HTTP**（wechat 长轮询、lark/微信出站、QR 登录、companion）以
+  `ctx.shell.run is not a function` 崩溃：实测飞书出站 0 次、渠道 state=error、
+  wechat 轮询每 2.5s 刷错——用户实测「飞书入站可达、回复不出去」的根因。
+  新增 `lib/shell-compat.js` 双代际适配：前台 `shellRun`（run 直通 / execute→
+  `result()`），后台 `shellStart`（start 直通 / execute 句柄直通）；Discord 常驻
+  伴进程显式 `onExpiry:'none'`（新代 `resolve` 默认 `'kill'`，会按默认 timeoutMs
+  杀掉常驻进程；旧代丢弃该未知字段无害），并修正旧代码未 await 启动句柄的隐患
+  （`startDiscord` 改 async、`startAdapter` 处 await）。测试矩阵覆盖两代：
+  `login-qr-route` 的 shell mock 切为 execute 代际端到端（贴合当前安装版运行时），
+  `host-smoke` 保留 run/start 代际，新增 `test/shell-compat.cjs` 单测两代分支、
+  双侧缺失的描述性错误与 result() 拒绝透传；`npm test` 现为**八项**。
 
 ### Added
 

@@ -78,18 +78,23 @@ const ctx = {
   },
   shell: {
     resolve(request) { return request },
-    async run(request) {
+    // 0.1.7-rc.2 安装版代际：execute(spec) 返回句柄，前台消费 result()。
+    // host-smoke 保留旧 run/start 代际的 mock——两代运行时在套件里各有端到端路径。
+    async execute(spec) {
       return {
-        exitCode: 0,
-        timedOut: false,
-        aborted: false,
-        timeoutMs: request.timeoutMs || 60000,
-        stdout: { text: gatewayStdout(request), truncated: false },
-        stderr: { text: '', truncated: false },
+        result: async () => ({
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          aborted: false,
+          timeoutMs: (spec && spec.timeoutMs) || 60000,
+          stdout: { text: gatewayStdout(spec), truncated: false },
+          stderr: { text: '', truncated: false },
+        }),
+        readOutput: () => ({ delta: '', lossy: false }),
+        kill: () => true,
+        done: Promise.resolve(),
       }
-    },
-    start() {
-      return { status: 'running', kill() { return false } }
     },
   },
   fs: {

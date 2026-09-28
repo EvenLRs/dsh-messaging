@@ -1,6 +1,6 @@
 {
   "name": "dsh-messaging",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH 消息渠道网关：静态 Host + 静态 Client 半区",
   "type": "module",
   "main": "lib/index.js",
@@ -35,7 +35,7 @@
     "ws": "^8.18.0"
   },
   "scripts": {
-    "test": "node test/qrcode-smoke.cjs && node test/login-qr-route.cjs && node test/session-id-migration.cjs && node test/host-smoke.cjs && node test/http-routes.cjs && node test/client-smoke.cjs && node test/client-login-flow.cjs"
+    "test": "node test/qrcode-smoke.cjs && node test/shell-compat.cjs && node test/login-qr-route.cjs && node test/session-id-migration.cjs && node test/host-smoke.cjs && node test/http-routes.cjs && node test/client-smoke.cjs && node test/client-login-flow.cjs"
   },
   "dsh": {
     "bundle": {
