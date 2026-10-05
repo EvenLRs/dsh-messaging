@@ -1,4 +1,6 @@
 'use strict'
+// 统一超时兜底：挂住即非零退出，npm test 不被拖死（见 test/_guard.cjs）。
+require('./_guard.cjs')
 // ctx.shell 双代际适配单测（lib/shell-compat.js）。
 // 背景：dsh-shell 存在两代公开契约——≤0.1.6 线 run/start、≥0.1.7-rc.2 线
 // execute 句柄（前台 result()、后台保留句柄）。安装版运行时是后者，只认

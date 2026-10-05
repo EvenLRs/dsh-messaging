@@ -1,4 +1,6 @@
 'use strict'
+// 统一超时兜底：挂住即非零退出，npm test 不被拖死（见 test/_guard.cjs）。
+require('./_guard.cjs')
 // 会话 id 防碰撞方案与分级迁移的回归测试（lib/session-id-migration.js）。
 // 用临时目录搭一个 DSH 宿主存储 fixture（sessions/<ws>/<id> + projcache +
 // workspace.json），断言：

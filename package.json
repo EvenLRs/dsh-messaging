@@ -1,7 +1,7 @@
 {
   "name": "dsh-messaging",
-  "version": "0.2.1",
-  "description": "DSH 消息渠道网关：静态 Host + 静态 Client 半区",
+  "version": "0.3.1",
+  "description": "DSH 消息渠道网关：将Deepseek Harness接入你的IM，随时随地和Deepseek Harness进行沟通",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -31,11 +31,23 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
+    "@deepseek-ai/dsh-credentials": "0.2.0-rc.1",
+    "@deepseek-ai/schemastery": "3.18.4",
     "@larksuiteoapi/node-sdk": "^1.74.0",
     "ws": "^8.18.0"
   },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/cordis-plugin-loader": "~1.0.5",
+    "@deepseek-ai/dsh-settings": "^0.2.0-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis-plugin-loader": {
+      "optional": true
+    }
+  },
   "scripts": {
-    "test": "node test/qrcode-smoke.cjs && node test/shell-compat.cjs && node test/login-qr-route.cjs && node test/session-id-migration.cjs && node test/host-smoke.cjs && node test/http-routes.cjs && node test/client-smoke.cjs && node test/client-login-flow.cjs"
+    "test": "node test/qrcode-smoke.cjs && node test/shell-compat.cjs && node test/login-qr-route.cjs && node test/session-id-migration.cjs && node test/config-schema.cjs && node test/loader-integration.cjs && node test/config-migration.cjs && node test/wechat-credentials.cjs && node test/incremental-rebuild.cjs && node test/host-smoke.cjs && node test/http-routes.cjs && node test/config-redaction.cjs && node test/status-redaction.cjs && node test/webhook-error-redaction.cjs && node test/client-smoke.cjs && node test/client-login-flow.cjs"
   },
   "dsh": {
     "bundle": {
@@ -47,7 +59,8 @@
         "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-slots"
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
       ]
     }
   },

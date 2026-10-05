@@ -13,10 +13,8 @@ function readStdin() {
   })
 }
 
-function argValue(name) {
-  const index = process.argv.indexOf('--' + name)
-  return index >= 0 ? process.argv[index + 1] : ''
-}
+// 泄露点 4：凭据一律从 stdin 的 JSON 读，argv 只保留子命令（如 `onebot verify`）。
+// 宿主侧对应 companionRun('crypto-helper.cjs', ['onebot','verify'], { secret, ... })。
 
 function sha1Hex(value) {
   return crypto.createHash('sha1').update(value, 'utf8').digest('hex')
@@ -73,9 +71,9 @@ async function main() {
   const input = safeParse(await readStdin())
   try {
     if (command === 'wecom') {
-      const token = argValue('token')
-      const aesKeyRaw = argValue('aes-key')
-      const receiveId = argValue('receiveid')
+      const token = String(input.token || '')
+      const aesKeyRaw = String(input.aesKey || '')
+      const receiveId = String(input.receiveId || '')
       const aesKey = decodeAesKey(aesKeyRaw)
       const encrypted = input.encrypt || input.echostr || ''
       const signature = input.signature || ''
@@ -90,7 +88,7 @@ async function main() {
     }
 
     if (command === 'lark' && op === 'decrypt') {
-      const key = crypto.createHash('sha256').update(String(argValue('key')), 'utf8').digest()
+      const key = crypto.createHash('sha256').update(String(input.key || ''), 'utf8').digest()
       const encrypted = input.encrypt || ''
       const iv = key.subarray(0, 16)
       const plain = aesCbcDecrypt(key, iv, encrypted)
@@ -98,7 +96,7 @@ async function main() {
     }
 
     if (command === 'onebot' && op === 'verify') {
-      const secret = argValue('secret')
+      const secret = String(input.secret || '')
       const signature = String(input.signature || '')
       const rawBody = typeof input.rawBody === 'string' ? input.rawBody : ''
       if (!secret || !signature) {
@@ -115,7 +113,7 @@ async function main() {
     }
 
     if (command === 'slack' && op === 'verify') {
-      const signingSecret = argValue('signing-secret')
+      const signingSecret = String(input.signingSecret || '')
       const timestamp = String(input.timestamp || '')
       const signature = String(input.signature || '')
       const rawBody = typeof input.rawBody === 'string' ? input.rawBody : ''

@@ -1,4 +1,6 @@
 'use strict'
+// 统一超时兜底：挂住即非零退出，npm test 不被拖死（见 test/_guard.cjs）。
+require('./_guard.cjs')
 const path = require('node:path')
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
@@ -113,6 +115,24 @@ async function invoke(method, path, opts) {
   return { status: res.statusCode, json, text: res.body }
 }
 
+// P5：`/__dsh-messaging/config` 已删除；配置真源 = config.json，改完用 /reload 生效。
+const configFileKey = () => [...writtenFiles.keys()].filter((key) => key.includes('.dsh-messaging/config.json'))[0]
+
+function readConfig() {
+  const key = configFileKey()
+  assert.ok(key, 'config.json must exist after the first start')
+  return JSON.parse(writtenFiles.get(key))
+}
+
+async function saveConfig(config) {
+  const key = configFileKey()
+  assert.ok(key, 'config.json must exist before it can be rewritten')
+  writtenFiles.set(key, JSON.stringify(config))
+  const reload = await invoke('POST', '/__dsh-messaging/reload', { headers: loopbackHeaders() })
+  assert.equal(reload.status, 200, 'reload must pick the new config up: ' + JSON.stringify(reload.json))
+  return reload
+}
+
 function loopbackHeaders(extra) {
   return Object.assign({
     origin: 'http://127.0.0.1:3080',
@@ -127,7 +147,6 @@ async function main() {
 
   const expected = [
     '/__dsh-messaging/status',
-    '/__dsh-messaging/config',
     '/__dsh-messaging/reload',
     '/__dsh-messaging/send',
     '/__dsh-messaging/ilink/login/start',
@@ -138,6 +157,8 @@ async function main() {
   for (const pathName of expected) {
     assert.equal(routes.has(pathName), true, 'route missing: ' + pathName)
   }
+  // P5 收口回归：旧配置入口必须消失，读写只走官方 settings 通道。
+  assert.equal(routes.has('/__dsh-messaging/config'), false, 'the legacy config route must be gone (P5)')
   assert.equal(plugin.name, 'dsh-messaging')
   assert.ok(plugin.inject.includes('webServer'))
 
@@ -172,10 +193,8 @@ async function main() {
   assert.ok(Array.isArray(status.json.channels))
   assert.equal(status.json.channels.length, 7)
 
-  const config = await invoke('GET', '/__dsh-messaging/config', { headers: loopbackHeaders() })
-  assert.equal(config.status, 200)
-  assert.ok(config.json.config)
-  assert.ok(config.json.config.adapters)
+  const config = readConfig()
+  assert.ok(config.adapters)
 
   const methodNotAllowed = await invoke('POST', '/__dsh-messaging/status', { headers: loopbackHeaders(), body: '{}' })
   assert.equal(methodNotAllowed.status, 405)
@@ -203,13 +222,9 @@ async function main() {
   })
   assert.equal(defaultPortHost.status, 200, 'http://host:80 and http://host are the same authority')
 
-  const nextConfig = JSON.parse(JSON.stringify(config.json.config))
+  const nextConfig = JSON.parse(JSON.stringify(config))
   nextConfig.adapters.onebot.enabled = false
-  const saved = await invoke('POST', '/__dsh-messaging/config', {
-    headers: loopbackHeaders({ 'content-type': 'application/json' }),
-    body: JSON.stringify(nextConfig),
-  })
-  assert.equal(saved.status, 200)
+  const saved = await saveConfig(nextConfig)
   const onebot = saved.json.channels.find((channel) => channel.key === 'onebot')
   assert.equal(onebot.enabled, false)
 
