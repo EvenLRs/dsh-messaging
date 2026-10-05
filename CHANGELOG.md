@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.3.1
+
+0.2.1 之后第一个发布到 npm 的版本，包含下方 0.3.0 的全部改动（0.3.0 未单独发布）。
+
+**兼容性**
+
+- 支持 DSH 0.2.0-rc.2：peer `@deepseek-ai/dsh-settings` 从精确的 `0.2.0-rc.1` 放宽为
+  `^0.2.0-rc.1`（覆盖 0.2.x 的所有 rc 与正式版，不含 0.3.0 预发布）。0.3.0 在 DSH
+  0.2.0-rc.2 上会被兼容性检查拒绝加载。rc.1 → rc.2 之间插件用到的 Host 侧包
+  （cordis、cordis-plugin-loader、schemastery、dsh-settings、dsh-credentials 等）
+  逐字节一致，客户端侧仅有文案与样式编号变化，真实 Loader 集成测试在 rc.2 上通过。
+
+**修复**
+
+- 飞书：SDK 日志按段分类，`[ws] receive message` 收帧痕迹此前因只读首段而丢失；
+  新增 `invoke-error` 痕迹。
+- 飞书：为「用户进入与机器人单聊」事件注册空处理器，消除每次的 unhandled 噪声
+  （首次出现仍记一条 `noted`）。
+- 飞书：新增“已知、无需处理的事件”表 `LARK_NOOP_EVENTS` 统一管理空处理器
+  （原单聊事件的单独常量与 `accessEventNoted` 布尔值改为**按事件类型**的 Set），
+  `dispatcher.register` 与日志分类器里跳过 `execute X handle` 的判断改为同表驱动。
+- 飞书：为 `im.message.message_read_v1`（消息已读回执）注册空处理器。实机上每读
+  一条消息就会多一条 `lark-event … outcome=unhandled` 噪声；现在该事件**首次**出现
+  记一条 `outcome='noted'`，之后只刷新 `lark.detail.lastEventAt`，不再进 recent。
+
+## 0.3.0
+
+配置体系对齐官方 settings（P1–P5）：密钥出口脱敏、配置真源与写入收敛、配置入口迁到
+插件页、组件按 slots 约定改写、遗留配置路由收口；顺带把凭据从命令行挪进 stdin。
+
+**Breaking（0.2.x → 0.3.0）**
+
+- 配置入口从「设置 → 消息通道配置」迁到**插件页 → dsh-messaging → 配置**。
+- `GET/POST /__dsh-messaging/config` 不复存在：脚本化调用需改走 `settings.describe` /
+  `settings.update(ops, revision)`；`secretsSet`、`__clearSecrets`、整树 POST 一并废弃。
+- 新增 `peerDependencies`（`@deepseek-ai/cordis`、`cordis-plugin-loader`、
+  `dsh-settings`、`schemastery` 等，由宿主提供）；`Config` 改为 schemastery schema 导出。
+- 密钥清除语义改为 `op:'unset'`（删用户覆盖、回落组合层），不再是 `set ''`。
+
+### 安全
+
+- **命令行不再携带任何凭据。** 出站 curl 改为 `curl --config -`：URL、请求头、请求体
+  全部进 stdin 的 curl 配置，进程列表与 shell 日志里不再出现 `Authorization` 头、
+  目标地址与请求体；伴随进程 `crypto-helper.cjs` 的 `--secret/--signing-secret/
+  --token/--aes-key/--key` 从 argv 改走 stdin JSON，`discord-gateway.cjs` 删除 argv
+  `--token` 兼容分支。shell 桩用例逐条断言**任何 shell 调用的 command/argv 都不含
+  密钥值**。
+- **配置的 HTTP 读取面删除。** 掩码视图时代的 `redactConfig` / `applySecretPolicy` /
+  `secretsSet` / `__clearSecrets` 随路由一起移除；密钥出口只剩：
+  `settings.describe({redactSecrets:true})` 的 `role('secret')` 掩码 + 「是否已设置」
+  sidecar，以及状态/出站/webhook 错误的值匹配 + 模式匹配两层脱敏（`***`）与固定短语。
+- 仍生效的出口护栏：`GET /status`、`POST /reload`、`POST /send`、入站 webhook 错误体、
+  recent/errors 快照——任何一处都不再回传密钥明文；recent 的出口唯一走 `statusSnapshot`。
+
+### 变更
+
+- **配置写入收敛到官方通道**：页面读 `settings.describe` 镜像（value/revision/secrets/
+  可写性同源），写 `settings.update(ops, revision)` → `loader/volatile-update` →
+  `diffConfigScopes` 按渠道增量重建；revision 冲突 → 页面提示并丢草稿。
+- **按渠道增量重建（P2c）**：单渠道字段只拆建该渠道（telegram 长轮询、wechat 循环
+  按代际停止），`agent.*` 只对新会话生效，其他字段变更才整体 rebuildAll；
+  「改出站地址 → 清随行密钥」的唯一入口是 `loader/volatile-update`。
+- **个人微信 token 迁凭据存储**（record `dsh-messaging/wechat-bot`），配置与
+  `defaultConfig` 不再携带 `wechat.token` 字段。
+- **wechatPollLoop 增加最小轮询间隔 `ILINK_MIN_POLL_GAP_MS`(500ms)。** 网关**秒回**
+  （200 + 空结果）时原实现会在微任务里自旋：事件循环被饿死、进程空转烧 CPU
+  （实测残留进程空转 22 小时）。真实长轮询耗时 ≥ 间隔，正常路径不受影响；
+  失败路径直接抛出也走不到等待。
+- **组件按 slots 约定改写（P4）**：业务与传输状态收进 controller，组件只消费 props
+  （零 `ctx.` 读取）、只读态全部 disabled、locale 走注册项 + `props.t`。
+- `state.recent` 的出口唯一走 `statusSnapshot`（泄露点 8 定义处已加注释）。
+
+### 迁移
+
+- 旧 `~/.dsh-messaging/config.json` 首次启动自动导入当前 profile：**只导 volatile 字段**
+  （`workspaceRoot`/`runtime.*` 无法经 settings 写入，留在原地），微信 token 单独迁到
+  凭据 record；成功后原文件改名 `config.json.imported`，失败自动改回原名下次重试，
+  幂等（marker 在即不再写）。
+- 非 volatile 字段一律由官方 settings 校验拒绝（`is not volatile`）；页面只枚举表单里
+  的 volatile 字段，普通字段不再进 ops。
+- 测试同步迁移：安全断言从旧路由改到 describe 镜像 / 出口 / 磁盘真源三条真实路径，
+  **没有删断言**（`config-redaction` / `host-smoke` / `http-routes` / `config-migration`
+  / `loader-integration` / `client-smoke` 等）。
+- 测试新增统一超时兜底 `test/_guard.cjs`（每个脚本开头 require）：主线程 unref 定时器
+  兜「有真实句柄占着循环」的挂起，worker 线程硬杀兜**微任务风暴饿死主线程**的情形
+  （前者定时器根本排不进来）；两层都以非零码终止，`npm test` 不会挂住。
+  超时可用 `DSH_TEST_TIMEOUT_MS` 覆盖（默认 60000ms）。
+
 ## 0.2.1
 
 会话 id 防碰撞与分级迁移、dsh-shell 双代际适配（修复安装版运行时下全部 shell HTTP）、

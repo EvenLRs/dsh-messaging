@@ -1,3 +1,4 @@
+require('./_guard.cjs') // 统一超时兜底：挂住即非零退出（见 test/_guard.cjs）
 const path = require('node:path')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
@@ -17,6 +18,10 @@ const effectDisposers = []
 const shellCalls = []
 const writtenFiles = new Map()
 const createdAgents = []
+// P6（飞书实机排查）：会话被其他界面占用的两种形态，由用例切换。
+//   'reuse' —— resume 被拒，但宿主里有活着的 agent（等价于 DSH 桌面端开着该会话）；
+//   'stuck' —— resume 被拒且宿主里查不到活 agent（另一进程/瞬时占用）。
+const sessionBusy = { mode: 'off', live: null }
 // Durable session ids (survive the in-memory map being cleared) and resume calls.
 const persistedSessions = new Set()
 const resumedAgents = []
@@ -44,11 +49,9 @@ const fakeShell = {
   async run(request) {
     shellCalls.push(request)
     if (request.command.includes('crypto-helper.cjs')) {
-      const parts = request.command.split(/(?<!')\s+(?!')|\s+/)
-      const secretIndex = parts.indexOf("'--secret'") >= 0 ? parts.indexOf("'--secret'") : parts.indexOf('--secret')
-      const secretRaw = secretIndex >= 0 ? parts[secretIndex + 1] : ''
-      const secret = secretRaw.replace(/^'|'$/g, '').replace(/''/g, "'")
+      // P5：凭据改从 stdin 的 JSON 读，argv 里不再有 --secret。
       const input = JSON.parse(request.stdin || '{}')
+      const secret = String(input.secret || '')
       const crypto = require('node:crypto')
       const hmac = crypto.createHmac('sha1', secret).update(input.rawBody || '', 'utf8').digest('hex')
       const expected = 'sha1=' + hmac
@@ -88,11 +91,14 @@ const fakeShell = {
 // Injectable stand-in for @larksuiteoapi/node-sdk, consumed through the
 // ctx.get('dshMessaging.larkSdk') seam the adapter allows for tests.
 let larkEventHandler = null
+// 注册的全部 handler（含进单聊空处理器），用例直接调用它模拟 dispatcher 派发。
+const larkHandlers = {}
 const larkClients = []
 const fakeLarkSdk = {
-  LoggerLevel: { info: 'info' },
+  LoggerLevel: { info: 'info', debug: 'debug' },
   EventDispatcher: class {
     register(handlers) {
+      Object.assign(larkHandlers, handlers)
       larkEventHandler = handlers['im.message.receive_v1']
       return this
     }
@@ -176,6 +182,11 @@ const ctx = {
     },
     async resume(options) {
       const id = options.resumeSessionId
+      if (sessionBusy.mode !== 'off') {
+        const busy = new Error(`session "${id}" is already owned by an active write handle`)
+        busy.name = 'SessionAlreadyOwnedError'
+        throw busy
+      }
       if (!persistedSessions.has(id)) {
         const error = new Error(`session "${id}" not found`)
         error.name = 'SessionPersistenceNotFoundError'
@@ -192,6 +203,18 @@ const ctx = {
       }
       resumedAgents.push({ options, agent, handle })
       return handle
+    },
+    // 宿主的 agents.get(id)：返回当前活着的 agent（真实 dsh-agent 就是这个形状）。
+    get(id) {
+      if (sessionBusy.mode !== 'reuse') return undefined
+      if (!sessionBusy.live || sessionBusy.live.id !== id) {
+        sessionBusy.live = {
+          id,
+          messages: [],
+          followup(message) { sessionBusy.live.messages.push(message) },
+        }
+      }
+      return sessionBusy.live
     },
   },
 }
@@ -238,6 +261,26 @@ async function channelStatus(key) {
 }
 
 // 会话 id 派生不再本地镜像：直接用被测模块的真实实现（带键哈希的防碰撞方案）。
+// P5：`/__dsh-messaging/config` 已删除。配置的真源仍是磁盘上的 config.json
+// （loadConfig = defaultConfig + 这份文件），写入后用 POST /reload 生效——
+// 这与「设置页保存 → loader/volatile-update → 重建」的线上路径等价（本 harness 没有 Loader）。
+const configFileKey = () => [...writtenFiles.keys()].filter((key) => key.includes('.dsh-messaging/config.json'))[0]
+
+function readConfig() {
+  const key = configFileKey()
+  assert.ok(key, 'config.json must exist after the first start')
+  return JSON.parse(writtenFiles.get(key))
+}
+
+async function saveConfig(config) {
+  const key = configFileKey()
+  assert.ok(key, 'config.json must exist before it can be rewritten')
+  writtenFiles.set(key, JSON.stringify(config))
+  const reload = await invoke('POST', '/__dsh-messaging/reload')
+  assert.equal(reload.status, 200, 'reload must pick the new config up: ' + JSON.stringify(reload.json))
+  return reload
+}
+
 function loopbackHeaders(extra) {
   return Object.assign({
     origin: 'http://127.0.0.1:3080',
@@ -279,9 +322,7 @@ async function main() {
   assert.ok(plugin.inject.includes('agents'))
 
   // Set mock secret for onebot adapter and reload
-  const configRes = await invoke('GET', '/__dsh-messaging/config')
-  assert.equal(configRes.status, 200)
-  const config = configRes.json.config
+  const config = readConfig()
   config.adapters.onebot.secret = 'test-secret-456'
   config.adapters.onebot.accessToken = 'test-token-789'
   // Lark webhook coverage: the user supplies the credentials exactly as the Feishu
@@ -292,11 +333,7 @@ async function main() {
   config.adapters.lark.appSecret = 'secret_test'
   config.adapters.lark.verificationToken = 'user-token-abc'
   config.adapters.lark.encryptKey = 'user-encrypt-key-xyz'
-  const saved = await invoke('POST', '/__dsh-messaging/config', {
-    body: JSON.stringify(config),
-    headers: loopbackHeaders({ 'content-type': 'application/json' }),
-  })
-  assert.equal(saved.status, 200)
+  await saveConfig(config)
 
   // Trigger reload to apply the new secret
   const reloadRes = await invoke('POST', '/__dsh-messaging/reload', {
@@ -378,9 +415,12 @@ async function main() {
   })
   await tick()
 
-  const outboundCurl = shellCalls.find((call) => call.command.includes('send_private_msg'))
+  // P5：curl 改成 `--config -`，URL / 请求头 / 请求体都在 stdin 的配置里。
+  const outboundCurl = shellCalls.find((call) => String(call.stdin || '').includes('send_private_msg'))
   assert.equal(Boolean(outboundCurl), true, 'outbound reply should use curl')
-  assert.equal(outboundCurl.command.includes('--data-binary'), true, 'outbound JSON body should be sent via curl stdin')
+  assert.equal(outboundCurl.command, 'curl --config -', 'the argv carries no URL, header or secret')
+  assert.equal(String(outboundCurl.stdin).includes('data-binary = '), true, 'outbound JSON body rides in the stdin config')
+  assert.equal(String(outboundCurl.stdin).includes('send_private_msg'), true, 'the target URL lives in the stdin config')
 
   const statusRes = await invoke('GET', '/__dsh-messaging/status')
   assert.equal(statusRes.status, 200)
@@ -394,15 +434,20 @@ async function main() {
   // A conversation without a channel prefix still gets one in the key.
   assert.equal(status.sessions[0].key, 'onebot:private:1001')
   assert.equal(status.channels.length, 7)
-  const configResult = await invoke('GET', '/__dsh-messaging/config')
-  assert.equal(configResult.json.config.adapters.onebot.enabled, true)
+  assert.equal(readConfig().adapters.onebot.enabled, true)
 
   // Webhook credentials are user-supplied and must be stored verbatim: the values
   // have to match what the Feishu console holds, so the plugin must not rewrite them.
-  const larkConfig = (await invoke('GET', '/__dsh-messaging/config')).json.config.adapters.lark
-  assert.equal(larkConfig.verificationToken, 'user-token-abc', 'the user-supplied token must be kept')
-  assert.equal(larkConfig.encryptKey, 'user-encrypt-key-xyz', 'the user-supplied encrypt key must be kept')
-  const userToken = larkConfig.verificationToken
+  // P5 收口：配置视图已经**不提供** HTTP 读取面（路由删除），所以 P1 的「回传必须抹成
+  // 空串」断言迁移为两条更强的入口断言：磁盘原样保存；出口（/status）永远拿不到。
+  const larkConfig = readConfig().adapters.lark
+  assert.equal(larkConfig.verificationToken, 'user-token-abc', 'the console token must be stored verbatim')
+  assert.equal(larkConfig.encryptKey, 'user-encrypt-key-xyz', 'the console encrypt key must be stored verbatim')
+  assert.equal(routes.has('/__dsh-messaging/config'), false, 'the legacy config read/write route must be gone (P5)')
+  const larkStatus = await invoke('GET', '/__dsh-messaging/status', { headers: loopbackHeaders() })
+  assert.equal(JSON.stringify(larkStatus.json).includes('user-token-abc'), false, 'the lark token never leaves over /status')
+  assert.equal(JSON.stringify(larkStatus.json).includes('user-encrypt-key-xyz'), false, 'the lark encrypt key never leaves over /status')
+  const userToken = 'user-token-abc'
 
   // The persisted record is what the inbound gate reads. The plugin builds this
   // path with POSIX joins, so compare on normalized separators.
@@ -442,12 +487,11 @@ async function main() {
 
   // Plaintext inbound requires the Feishu side to run without an Encrypt Key, so
   // clear it before exercising the message path (the key case is asserted above).
-  const plaintextConfig = (await invoke('GET', '/__dsh-messaging/config')).json.config
+  const plaintextConfig = readConfig()
   plaintextConfig.adapters.lark.encryptKey = ''
-  await invoke('POST', '/__dsh-messaging/config', {
-    body: JSON.stringify(plaintextConfig),
-    headers: loopbackHeaders({ 'content-type': 'application/json' }),
-  })
+  // 直写磁盘的空串就是「清空」：掩码回传时代的 __clearSecrets 保留键已随路由删除；
+  // settings 通道里的清空语义是 op:'unset'（见 test/config-migration.cjs 场景 4b）。
+  await saveConfig(plaintextConfig)
   await tick()
 
   const agentsBeforeLark = createdAgents.length
@@ -485,15 +529,116 @@ async function main() {
   assert.equal(createdAgents.length, agentsBeforeV2 + 1, 'a v2 webhook event must reach an agent')
   assert.equal(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, 'v2 webhook message')
 
+  // ── 飞书入站痕迹：每个丢弃分支都要在 recent 里留痕（kind=lark-drop）────
+  // 只记原因与 message_type / chat_type / 文本长度，**绝不记消息原文**；
+  // 富文本 post 则必须摊平成纯文本后照常入站。
+  const larkDrops = async () => {
+    const st = await invoke('GET', '/__dsh-messaging/status', { headers: loopbackHeaders() })
+    return st.json.recent.filter((entry) => entry.kind === 'lark-drop')
+  }
+  assert.equal((await larkDrops()).length, 0, 'no lark event has been dropped so far')
+
+  // 1) 富文本 post：标题 + 段落摊平（没有文本的图片段被跳过）→ 照常入站。
+  const agentsBeforePost = createdAgents.length
+  const postEvent = await postLark({
+    token: userToken,
+    event: {
+      type: 'im.message.receive_v1',
+      chat_id: 'oc_post',
+      message: {
+        message_id: 'om_post',
+        message_type: 'post',
+        chat_id: 'oc_post',
+        chat_type: 'p2p',
+        content: JSON.stringify({
+          title: 'post-title',
+          content: [
+            [{ tag: 'text', text: 'line-1' }],
+            [{ tag: 'img', image_key: 'img-key-not-text' }],
+            [{ tag: 'a', text: 'link-label', href: 'https://example.invalid/x' }],
+          ],
+        }),
+      },
+    },
+  })
+  assert.equal(postEvent.statusCode, 200)
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(createdAgents.length, agentsBeforePost + 1, 'a rich text post must reach an agent')
+  assert.equal(
+    createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text,
+    'post-title\nline-1\nlink-label',
+    'post is flattened to plain text (elements without text are skipped)',
+  )
+  assert.equal((await larkDrops()).length, 0, 'a delivered post produces no drop record')
+
+  // 2) 图片消息（content 里没有文本）→ 不支持的类型，只留元数据。
+  const imageEvent = await postLark({
+    token: userToken,
+    event: {
+      type: 'im.message.receive_v1',
+      message: {
+        message_id: 'om_img',
+        message_type: 'image',
+        chat_id: 'oc_img',
+        chat_type: 'p2p',
+        content: JSON.stringify({ image_key: 'img-key-secret' }),
+      },
+    },
+  })
+  assert.equal(imageEvent.statusCode, 200)
+  await tick()
+  const imageDrop = (await larkDrops())[0]
+  assert.equal(imageDrop.reason, 'unsupported message_type')
+  assert.equal(imageDrop.messageType, 'image')
+  assert.equal(imageDrop.chatType, 'p2p')
+  assert.equal(imageDrop.textLen, null)
+  assert.equal(JSON.stringify(imageDrop).includes('img-key-secret'), false, 'a drop record must never carry the payload')
+
+  // 3) 空文本 → no text（长度如实记录，文本本身不记）。
+  const emptyEvent = await postLark({
+    token: userToken,
+    event: {
+      type: 'im.message.receive_v1',
+      message: { message_id: 'om_empty', message_type: 'text', chat_id: 'oc_empty', chat_type: 'p2p', content: JSON.stringify({ text: '   ' }) },
+    },
+  })
+  assert.equal(emptyEvent.statusCode, 200)
+  await tick()
+  const emptyDrop = (await larkDrops())[1]
+  assert.equal(emptyDrop.reason, 'no text')
+  assert.equal(emptyDrop.textLen, 3, 'the whitespace length is recorded, the text is not')
+
+  // 4) 缺 chatId → no chatId。
+  const noChatEvent = await postLark({
+    token: userToken,
+    event: {
+      type: 'im.message.receive_v1',
+      message: { message_id: 'om_noid', message_type: 'text', chat_type: 'p2p', content: JSON.stringify({ text: 'no-chat-id-body' }) },
+    },
+  })
+  assert.equal(noChatEvent.statusCode, 200)
+  await tick()
+  const noChatDrop = (await larkDrops())[2]
+  assert.equal(noChatDrop.reason, 'no chatId')
+  assert.equal(noChatDrop.textLen, 'no-chat-id-body'.length)
+  assert.equal(JSON.stringify(noChatDrop).includes('no-chat-id-body'), false, 'the text itself is never recorded')
+
+  // 5) 缺 message；6) 非消息事件。
+  assert.equal((await postLark({ token: userToken, event: { type: 'im.message.receive_v1' } })).statusCode, 200)
+  await tick()
+  assert.equal((await larkDrops())[3].reason, 'no message')
+  assert.equal((await postLark({ token: userToken, event: { type: 'im.chat.access_event.v1' } })).statusCode, 200)
+  await tick()
+  const allDrops = await larkDrops()
+  assert.equal(allDrops.length, 5, 'every dropped branch leaves exactly one trace')
+  assert.equal(allDrops[4].reason, 'not im.message.receive_v1')
+  assert.equal(allDrops.some((entry) => JSON.stringify(entry).includes('line-1')), false, 'no drop record ever contains message text')
+
   // Long connection (WebSocket) subscription: appId + appSecret only, authenticated
   // at connect time, so no public address, no verification token, no encrypt key.
-  const lcConfig = (await invoke('GET', '/__dsh-messaging/config')).json.config
+  const lcConfig = readConfig()
   lcConfig.adapters.lark.mode = 'long-connection'
-  const lcSaved = await invoke('POST', '/__dsh-messaging/config', {
-    body: JSON.stringify(lcConfig),
-    headers: loopbackHeaders({ 'content-type': 'application/json' }),
-  })
-  assert.equal(lcSaved.status, 200)
+  await saveConfig(lcConfig)
   await tick()
 
   assert.equal(larkClients.length, 1, 'long connection mode must create exactly one WSClient')
@@ -506,6 +651,9 @@ async function main() {
   const lcStatus = await channelStatus('lark')
   assert.equal(lcStatus.state, 'running', 'onReady should mark the channel running')
   assert.equal(lcStatus.detail.mode, 'long-connection')
+  // 飞书入站痕迹：connectedAt 记录 onReady 的时刻（握手成功才有值）。
+  assert.equal(typeof lcStatus.detail.connectedAt, 'number', 'connectedAt must record the onReady time')
+  const lastEventBeforeWs = lcStatus.detail.lastEventAt
 
   // No HTTP webhook route is registered in this mode.
   assert.equal(routes.has('/messaging/lark/events'), false, 'long connection mode must not register the webhook route')
@@ -549,6 +697,84 @@ async function main() {
   await new Promise((r) => setTimeout(r, 20))
   assert.equal(createdAgents.length, agentsBeforeLc + 1, 'a pushed long-connection event should reach an agent')
   assert.equal(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, 'hi over ws')
+  // 长连接送达的事件同样刷新 lastEventAt（connectedAt 不受影响）。
+  const larkTraceStatus = await channelStatus('lark')
+  assert.equal(typeof larkTraceStatus.detail.lastEventAt, 'number', 'lastEventAt must record the delivered event')
+  assert.ok(
+    lastEventBeforeWs === null || larkTraceStatus.detail.lastEventAt > lastEventBeforeWs,
+    'the event timestamp moves forward when an event arrives',
+  )
+  assert.equal(typeof larkTraceStatus.detail.connectedAt, 'number', 'connectedAt survives later event updates')
+
+  // ── SDK 层痕迹（lark-event）：日志行只提取字段，绝不落事件体 ─────────────
+  // 真实调用形状（回归用例）：EventDispatcher 经 LoggerProxy → logger.warn(['<行>'])
+  // 单元素数组；WSClient 是 logger.debug('[ws]', '<行>') → ['[ws]', '<行>'] 双元素。
+  // 只取 [0] 会永远拿到 '[ws]' 而漏掉整行——必须逐段分类（实机 ws 痕迹缺失即此因）。
+  const sdkLogger = ws.params.logger
+  assert.equal(typeof sdkLogger.debug, 'function', 'the SDK logger must be injected for tracing')
+  const larkSdkEvents = async () => {
+    const st = await invoke('GET', '/__dsh-messaging/status', { headers: loopbackHeaders() })
+    return st.json.recent.filter((entry) => entry.kind === 'lark-event')
+  }
+  assert.equal((await larkSdkEvents()).length, 0, 'no SDK line has been traced yet')
+
+  // a) dispatcher 形状（单元素数组）：未注册类型 → unhandled。
+  sdkLogger.warn(['no im.example.unregistered_event.v1 handle'])
+  // b) WSClient 真实形状（['[ws]', '…']）：数据帧到达 → frame（修复前会整行漏掉）。
+  sdkLogger.debug(['[ws]', 'receive message, message_type: event; message_id: m-frame; trace_id: t-frame; data: {"text":"FRAMED-SECRET-BODY"}'])
+  // c) 噪声行：不得入 recent。
+  sdkLogger.debug(['register app_ticket handle'])
+  sdkLogger.info(['event-dispatch is ready'])
+  // d) 我们自己已覆盖的类型：execute 去重，不重复记。
+  sdkLogger.debug(['execute im.message.receive_v1 handle'])
+  sdkLogger.debug(['execute im.chat.access_event.bot_p2p_chat_entered_v1 handle'])
+  await tick()
+  const sdkEvents = await larkSdkEvents()
+  assert.equal(sdkEvents.length, 2, 'only the two event-bearing lines are traced (execute rows are deduped)')
+  const frameEvent = sdkEvents.find((entry) => entry.source === 'ws')
+  assert.ok(frameEvent, 'the ws frame arrival must be traced from the ["[ws]", …] shape')
+  assert.equal(frameEvent.outcome, 'frame')
+  assert.equal(frameEvent.messageType, 'event', 'the frame type is extracted from the header, not the body')
+  const dispatcherEvent = sdkEvents.find((entry) => entry.source === 'dispatcher')
+  assert.ok(dispatcherEvent, 'the dispatcher line is traced')
+  assert.equal(dispatcherEvent.eventType, 'im.example.unregistered_event.v1')
+  assert.equal(dispatcherEvent.outcome, 'unhandled', 'an unregistered event type is the thing this trace exists for')
+  const traceText = JSON.stringify(sdkEvents)
+  assert.equal(traceText.includes('FRAMED-SECRET-BODY'), false, 'the event body must never enter recent')
+  assert.equal(traceText.includes('register app_ticket'), false, 'startup noise is not an event')
+  assert.equal(traceText.includes('event-dispatch is ready'), false, 'readiness logs are not events')
+
+  // ── 进单聊事件：空处理器（不再打 unhandled 噪声）+ 痕迹只留一次 ──────────
+  const chatEntered = larkHandlers['im.chat.access_event.bot_p2p_chat_entered_v1']
+  assert.equal(typeof chatEntered, 'function', 'the chat-entered event must have a registered handler')
+  await chatEntered({})
+  await chatEntered({})
+  await tick()
+  const afterAccess = await larkSdkEvents()
+  assert.equal(afterAccess.length, 3, 'the chat-entered event is noted exactly once')
+  const noted = afterAccess.find((entry) => entry.eventType === 'im.chat.access_event.bot_p2p_chat_entered_v1')
+  assert.ok(noted, 'the first chat-entered event leaves one trace')
+  assert.equal(noted.outcome, 'noted')
+  assert.equal(typeof (await channelStatus('lark')).detail.lastEventAt, 'number', 'any event refreshes lastEventAt')
+
+  // ── 消息已读事件：同一张表的空处理器 + 首次 noted；execute 不重复进 recent ──
+  const messageRead = larkHandlers['im.message.message_read_v1']
+  assert.equal(typeof messageRead, 'function', 'the message-read event must have a registered handler')
+  sdkLogger.debug(['execute im.message.message_read_v1 handle']) // 分类器按表去重：不进 recent
+  await messageRead({})
+  await messageRead({})
+  await tick()
+  const afterRead = await larkSdkEvents()
+  assert.equal(afterRead.length, 4, 'the execute row is skipped and the read event is noted exactly once')
+  const readNoted = afterRead.find((entry) => entry.eventType === 'im.message.message_read_v1')
+  assert.ok(readNoted, 'the first message-read event leaves one trace')
+  assert.equal(readNoted.outcome, 'noted')
+  assert.equal(
+    afterRead.filter((entry) => entry.eventType === 'im.chat.access_event.bot_p2p_chat_entered_v1').length,
+    1,
+    'the chat-entered trace stays exactly once (dedupe is per event type)',
+  )
+  assert.equal(typeof (await channelStatus('lark')).detail.lastEventAt, 'number', 'lastEventAt keeps refreshing for every known event')
 
   // A conversation that already carries its channel prefix (the adapters strip it when
   // sending, so inbound conversations look like "lark:oc_x") must not be prefixed again.
@@ -597,14 +823,73 @@ async function main() {
 
   // Disabling the channel must close the connection rather than leak it.
   lcConfig.adapters.lark.enabled = false
-  await invoke('POST', '/__dsh-messaging/config', {
-    body: JSON.stringify(lcConfig),
-    headers: loopbackHeaders({ 'content-type': 'application/json' }),
-  })
+  await saveConfig(lcConfig)
   await tick()
   await new Promise((r) => setTimeout(r, 10))
   assert.equal(ws.closed, true, 'disabling the adapter must close the long connection')
 
+  // ── 会话被其他界面占用（实机：飞书消息已到达、agent followup 却失败）──────
+  const statusBeforeBusy = (await invoke('GET', '/__dsh-messaging/status')).json
+  const onebotBeforeBusy = statusBeforeBusy.channels.find((channel) => channel.key === 'onebot')
+  const inboundBeforeBusy = onebotBeforeBusy.inboundCount
+  const postOnebotAs = async (userId, text) => {
+    const payload = JSON.stringify({
+      post_type: 'message',
+      message_type: 'private',
+      user_id: userId,
+      self_id: 999,
+      raw_message: text,
+      sender: { user_id: userId, nickname: 'busy' },
+    })
+    const signature = crypto.createHmac('sha1', 'test-secret-456').update(payload, 'utf8').digest('hex')
+    const req = fakeRequest('POST', '/messaging/onebot', payload)
+    req.headers = { 'content-type': 'application/json', 'x-signature': 'sha1=' + signature, 'x-self-id': '999' }
+    const res = fakeResponse()
+    await onebotRoute(req, res)
+    await tick()
+    return res
+  }
+
+  // A) 宿主里有活着的 agent（等价于 DSH 桌面端开着该会话）→ 复用它：
+  //    消息必须并入那个会话，渠道不得被标成 error，状态页给出“同时在其他界面打开”。
+  sessionBusy.mode = 'reuse'
+  const reuseRes = await postOnebotAs(2002, 'busy reuse')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(reuseRes.statusCode < 400, true, 'a shared session must not fail the webhook')
+  assert.equal(
+    sessionBusy.live && sessionBusy.live.messages.length,
+    1,
+    'the message must be delivered to the live agent the other surface owns',
+  )
+  const statusAfterReuse = (await invoke('GET', '/__dsh-messaging/status')).json
+  const onebotAfterReuse = statusAfterReuse.channels.find((channel) => channel.key === 'onebot')
+  assert.equal(onebotAfterReuse.state, 'running', 'a shared session must not mark the adapter as failed')
+  assert.ok(
+    statusAfterReuse.errors.some((entry) => entry.context === 'agent followup' && entry.message.includes('已并入该会话')),
+    'the shared-session notice must be recorded once',
+  )
+
+  // B) 占用方在宿主里查不到（另一进程/瞬时占用）→ 退避重试后给出可操作提示，
+  //    渠道仍是 running（不是 error），消息计数照常推进。
+  sessionBusy.mode = 'stuck'
+  const stuckRes = await postOnebotAs(3003, 'busy stuck')
+  await new Promise((resolve) => setTimeout(resolve, 1300)) // 3 × 300ms 退避
+  assert.equal(stuckRes.statusCode < 400, true, 'the webhook itself still succeeds')
+  const statusAfterStuck = (await invoke('GET', '/__dsh-messaging/status')).json
+  const onebotAfterStuck = statusAfterStuck.channels.find((channel) => channel.key === 'onebot')
+  assert.equal(onebotAfterStuck.state, 'running', 'a stuck session must not mark the adapter as failed')
+  assert.equal(onebotAfterStuck.inboundCount, inboundBeforeBusy + 2, 'both messages were counted as inbound')
+  assert.ok(
+    statusAfterStuck.errors.some((entry) => entry.context === 'agent followup'
+      && entry.message.includes('关闭 DSH 中打开的该会话')),
+    'the actionable bilingual guidance must be recorded',
+  )
+  assert.equal(
+    statusAfterStuck.errors.filter((entry) => entry.context === 'agent followup' && entry.message.includes('已并入该会话')).length,
+    1,
+    'the shared-session notice is recorded once per conversation (B is a different conversation)',
+  )
+  sessionBusy.mode = 'off'
 
   // 生命周期回归：UI 路由必须随 fiber 注销。真实 webServer 对 exact 重复注册会抛错
   // （上面的 mock 已对齐），因此「停用不注销 → 再启用必撞 duplicate exact route」

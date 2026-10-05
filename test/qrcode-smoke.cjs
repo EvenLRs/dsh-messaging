@@ -1,4 +1,6 @@
 'use strict'
+// 统一超时兜底：挂住即非零退出，npm test 不被拖死（见 test/_guard.cjs）。
+require('./_guard.cjs')
 // 二维码烟测：lib/qr-image.js 把登录载荷编成 SVG data URL，这里再用一个
 // **独立实现的解码器**（按 ISO/IEC 18004 手写：格式信息 BCH、功能图形、
 // zigzag 反掩码、RS 分块反交织、字节模式段解析）把它解回原始字符串。

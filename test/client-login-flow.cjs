@@ -1,4 +1,6 @@
 'use strict'
+// 统一超时兜底：挂住即非零退出，npm test 不被拖死（见 test/_guard.cjs）。
+require('./_guard.cjs')
 // 扫码登录轮询的回归测试（评审发现的既有缺陷）：
 // 服务端 expired 自动换码后，client 必须回到 wait 继续轮询——否则新码再次扫码的
 // confirmed 永远收不到，登录卡死。本用例用「队列化定时器 + 手动渲染周期」模拟
@@ -123,6 +125,33 @@ async function flush() {
   await new Promise((resolve) => setImmediate(resolve))
 }
 
+// 每个 store 只订一次（mock 的 useEffect 不跑 cleanup，重复订阅会让计数下不去）。
+const HOOK_SUBSCRIPTIONS = new Map()
+
+function bindFace(face, extra, dicts, React) {
+  const props = Object.assign({}, extra)
+  props.t = (key, params) => {
+    const dict = dicts['dsh-messaging']
+    return interpolate((dict && dict.en && dict.en[key]) || key, params)
+  }
+  for (const name of Object.keys(face.hooks || {})) {
+    const source = face.hooks[name]
+    const hookName = 'use' + name[0].toUpperCase() + name.slice(1)
+    props[hookName] = (selector) => {
+      const [, bump] = React.useState(0)
+      React.useEffect(() => {
+        if (!HOOK_SUBSCRIPTIONS.has(source)) {
+          HOOK_SUBSCRIPTIONS.set(source, source.subscribe(() => bump((value) => value + 1)))
+        }
+        return undefined
+      }, [])
+      return selector(source.getSnapshot())
+    }
+  }
+  for (const key of Object.keys(face)) if (key !== 'hooks') props[key] = face[key]
+  return props
+}
+
 async function main() {
   const counts = { config: 0, start: 0, status: 0 }
   const statusScript = ['wait', 'expired', 'wait', 'confirmed']
@@ -148,13 +177,38 @@ async function main() {
     return Promise.resolve({ ok: true, status: 200, text: async () => JSON.stringify(body) })
   }
 
+  // settings 镜像桩：页面通过 whileServed 挂载、从 namespace 行读 revision/secrets。
+  const mirrorRow = { ns: 'dsh-messaging', revision: 1, secrets: [], value: {} }
+  const configForms = {
+    describe() {
+      return {
+        namespace(ns) { return ns === mirrorRow.ns ? mirrorRow : undefined },
+        subscribe() { return () => {} },
+        load() { return Promise.resolve() },
+      }
+    },
+    whileServed(namespaces, register) {
+      if (namespaces.indexOf(mirrorRow.ns) !== -1) return register(new Set(namespaces))
+      return () => {}
+    },
+  }
+  // Host 交给页面的 volatile 投影（配置不再从 /config 拉）。
+  const formValue = JSON.parse(JSON.stringify(fixtureConfig))
+  delete formValue.version
+  delete formValue.workspaceRoot
+  delete formValue.runtime
+  const formState = { status: 'ready', writable: true, revision: 1, value: formValue }
+  const form = {
+    get state() { return formState },
+    mutate() { return Promise.resolve(true) },
+  }
   const timers = []
   const registrations = []
   const dicts = {}
   const slots = {
     inject(name, callback) {
-      if (name === 'settings.section' || name === 'tool.view.cordis') callback()
-      return () => {}
+      const dispose = callback()
+      return () => { if (typeof dispose === 'function') dispose() }
     },
     register(options, component) {
       registrations.push({ options, component })
@@ -183,6 +237,7 @@ async function main() {
     get(name) {
       if (name === 'slots') return slots
       if (name === 'locale') return locale
+      if (name === 'configForms') return configForms
       return undefined
     },
   }
@@ -196,12 +251,15 @@ async function main() {
   })
   plugin.apply(ctx)
 
-  const section = registrations.find((entry) => entry.options.name === 'settings.section')
-  assert.ok(section, 'settings.section registration should exist')
+  const section = registrations.find((entry) => entry.options.name === 'plugins.row.config')
+  assert.ok(section, 'the plugin page must be registered')
+  assert.equal(registrations.some((entry) => entry.options.name === 'settings.section'), false, 'settings.section is gone')
+  // 宿主把 inject 面绑成 props（hooks → useXxx(selector)），这里模拟它。
+  const pageFace = section.options.inject()
 
   const cycle = async () => {
     React.resetCursor()
-    const tree = render(section.component, {})
+    const tree = render(section.component, bindFace(pageFace, { view: 'page', form }, dicts, React))
     await flush()
     return tree
   }
@@ -220,7 +278,7 @@ async function main() {
 
   // 1) 首渲：config 未就绪，只有 loading；effect 拉取 config
   let tree = await cycle()
-  assert.ok(counts.config >= 1, 'mount must load config')
+  assert.equal(counts.config, 0, 'the page must not fetch the legacy config route')
 
   // 2) config 就绪 → 个人微信登录面板出现，尚未开始登录
   tree = await cycle()
@@ -259,6 +317,22 @@ async function main() {
   assert.match(text, /Login successful, token saved\./, 'the panel must report a successful login')
   assert.equal(countImages(tree), 0, 'confirmed must clear the QR image')
   assert.ok(findButton(tree, 'Generate'), 'panel must return to the generate state')
+
+  // ── P4：退订必须取消待发的轮询 timer（卸载后不留 timer）────────────────
+  const loginStore = pageFace.hooks.wechatLogin
+  await pageFace.generate()
+  await flush()
+  const mark = timers.length
+  React.resetCursor()
+  render(section.component, bindFace(pageFace, { view: 'page', form }, dicts, React))
+  await flush()
+  const pendingTimer = timers.slice(mark).find((entry) => !entry.cancelled)
+  assert.ok(pendingTimer, 'a waiting login schedules a poll timer')
+  const loginHookOff = HOOK_SUBSCRIPTIONS.get(loginStore)
+  assert.ok(loginHookOff, 'the page subscribed the login hook')
+  loginHookOff()
+  HOOK_SUBSCRIPTIONS.delete(loginStore)
+  assert.equal(pendingTimer.cancelled, true, 'the last unsubscribe cancels the pending timer')
 
   console.log('client-login-flow: ok')
 }

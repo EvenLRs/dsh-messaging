@@ -1,4 +1,6 @@
 'use strict'
+// 统一超时兜底：挂住即非零退出，npm test 不被拖死（见 test/_guard.cjs）。
+require('./_guard.cjs')
 // 登录路由集成测试：不碰网络，把 ctx.shell.run mock 成 ilink 网关，驱动
 // **真实的 HTTP 路由 + startIlinkLogin/pollIlinkLoginStatus 全链路**，
 // 断言设置页拿到的 qrcodeUrl 一直是可作 <img src> 的 SVG data URL——
@@ -26,9 +28,18 @@ const gateway = {
 const REAL_PAYLOAD =
   'https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=215f1c6f7cdc370e72094cc6b5431d3f&bot_type=3'
 
+// P5：curl 走 `--config -`，URL 与请求体都在 stdin 的配置里；命令行只剩 curl。
+function configBody(stdin) {
+  const match = /data-binary = "((?:[^"\\]|\\.)*)"/.exec(String(stdin || ''))
+  if (!match) return null
+  try { return JSON.parse(match[1].replace(/\\(.)/g, '$1')) } catch { return null }
+}
+
 function gatewayStdout(request) {
   const command = String((request && request.command) || '')
-  if (command.includes('get_bot_qrcode')) {
+  const stdin = String((request && request.stdin) || '')
+  const blob = command + '\n' + stdin
+  if (blob.includes('get_bot_qrcode')) {
     gateway.qrCalls++
     if (gateway.qr === 'fail') return '\n__DSH_STATUS__:500'
     if (gateway.qr === 'no-payload') {
@@ -42,18 +53,18 @@ function gatewayStdout(request) {
     })
     return body + '\n__DSH_STATUS__:200'
   }
-  if (command.includes('get_qrcode_status')) {
+  if (blob.includes('get_qrcode_status')) {
     gateway.statusCalls++
     const seq = gateway.statusSequence
     const idx = Math.min(gateway.statusCalls - 1, seq.length - 1)
     const status = seq[idx]
     return JSON.stringify({ status }) + '\n__DSH_STATUS__:200'
   }
-  if (command.includes('sendmessage')) {
-    try { gateway.lastSendPayload = JSON.parse(String(request.stdin || 'null')) } catch { gateway.lastSendPayload = null }
+  if (blob.includes('sendmessage')) {
+    gateway.lastSendPayload = configBody(stdin)
     return gateway.send + '\n__DSH_STATUS__:200'
   }
-  if (command.includes('getupdates')) {
+  if (blob.includes('getupdates')) {
     // 让长轮询循环**单次即退出**：mock 的 shell 瞬时解析会让 while 循环变成
     // 微任务风暴、饿死事件循环（启用 wechat 适配器后 suite 曾整体挂死）。
     return '\n__DSH_STATUS__:500'
@@ -236,10 +247,14 @@ async function main() {
 
   // 6.5) 启用 wechat 适配器（默认 disabled；出站用例要求 adapter 就绪，
   //      否则 sendOutbound 以 'adapter not ready' 失败——这正是 case7 首跑失败的原因）
-  const cfgBefore = await invoke('GET', '/__dsh-messaging/config')
-  const cfg = cfgBefore.json.config
+  // P5：/config 路由已删——直写 config.json + POST /reload 生效（legacy harness 的等价路径）。
+  const cfgKey = [...writtenFiles.keys()]
+    .find((entry) => entry.replace(/\\/g, '/').includes('.dsh-messaging/config.json'))
+  assert.ok(cfgKey, 'config.json must exist after the first start')
+  const cfg = JSON.parse(writtenFiles.get(cfgKey))
   cfg.adapters.wechat.enabled = true
-  const cfgSaved = await invoke('POST', '/__dsh-messaging/config', { body: JSON.stringify(cfg) })
+  writtenFiles.set(cfgKey, JSON.stringify(cfg))
+  const cfgSaved = await invoke('POST', '/__dsh-messaging/reload')
   assert.equal(cfgSaved.status, 200, 'config save must succeed')
   await new Promise((resolve) => setImmediate(resolve))
   await new Promise((resolve) => setImmediate(resolve))

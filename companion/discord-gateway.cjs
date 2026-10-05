@@ -43,7 +43,8 @@ async function getGateway(token) {
 
 async function main() {
   const stdinPayload = safeParse(await readStdin())
-  const token = process.argv.includes('--token') ? argValue('token') : stdinPayload.token || ''
+  // 密钥只从 stdin 读：argv 里不再有 --token（泄露点 4）。
+  const token = stdinPayload.token || ''
   if (!token) throw new Error('discord token is required')
   const intents = Number(argValue('intents') || stdinPayload.intents || 33281)
   const wsModulePath = argValue('ws-module') || 'ws'
