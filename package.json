@@ -31,7 +31,7 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-credentials": "0.2.0-rc.1",
+    "@deepseek-ai/dsh-credentials": "^0.2.0-rc.1",
     "@deepseek-ai/schemastery": "3.18.4",
     "@larksuiteoapi/node-sdk": "^1.74.0",
     "ws": "^8.18.0"
