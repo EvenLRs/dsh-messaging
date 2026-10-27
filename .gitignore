@@ -8,3 +8,4 @@ node_modules/
 # Local-only artifacts: not part of the published package.
 package-lock.json
 verify-lark.ps1
+/.implementation-plan.md
