@@ -1,6 +1,6 @@
 {
   "name": "dsh-messaging",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "DSH 消息渠道网关：将Deepseek Harness接入你的IM，随时随地和Deepseek Harness进行沟通",
   "type": "module",
   "main": "lib/index.js",
@@ -32,6 +32,7 @@
   },
   "dependencies": {
     "@deepseek-ai/dsh-credentials": "^0.2.0-rc.1",
+    "@deepseek-ai/node-addon-system": "~0.1.2",
     "@deepseek-ai/schemastery": "3.18.4",
     "@larksuiteoapi/node-sdk": "^1.74.0",
     "ws": "^8.18.0"
@@ -47,7 +48,8 @@
     }
   },
   "scripts": {
-    "test": "node test/qrcode-smoke.cjs && node test/shell-compat.cjs && node test/login-qr-route.cjs && node test/session-id-migration.cjs && node test/config-schema.cjs && node test/loader-integration.cjs && node test/config-migration.cjs && node test/wechat-credentials.cjs && node test/incremental-rebuild.cjs && node test/host-smoke.cjs && node test/http-routes.cjs && node test/config-redaction.cjs && node test/status-redaction.cjs && node test/webhook-error-redaction.cjs && node test/client-smoke.cjs && node test/client-login-flow.cjs"
+    "test": "node test/qrcode-smoke.cjs && node test/shell-compat.cjs && node test/login-qr-route.cjs && node test/session-id-migration.cjs && node test/config-schema.cjs && node test/loader-integration.cjs && node test/config-migration.cjs && node test/wechat-credentials.cjs && node test/incremental-rebuild.cjs && node test/host-smoke.cjs && node test/http-routes.cjs && node test/config-redaction.cjs && node test/status-redaction.cjs && node test/webhook-error-redaction.cjs && node test/client-smoke.cjs && node test/client-login-flow.cjs && node test/lark-text-splitter.cjs && node test/lark-card-api.cjs && node test/lark-card-layout.cjs && node test/lark-stream.cjs && node test/lark-settings-persistence.cjs && node test/lark-integration.cjs && node test/lark-diagnostics.cjs && node test/lark-dedup.cjs && node test/lark-admission.cjs && node test/lark-dedup-reverse.cjs && node test/lark-notice.cjs && node test/lark-install-regressions.cjs",
+  "test:host": "export DSH_HOSTX_ROOT=${DSH_HOSTX_ROOT:-${DSH_HOSTX:-/tmp/dsh-hostx}}; node test/lark-image.cjs && node test/lark-t5-attachments.cjs && node test/lark-fs-boundary.cjs && node test/lark-image-tool-real.mjs && node test/lark-image-services-host.mjs && node test/lark-image-scope-host.mjs && node test/lark-preset-host.mjs && DSH_TEST_TIMEOUT_MS=180000 node test/lark-image-transient-host.mjs && DSH_TEST_PROJECTION_FAILURE=1 node test/lark-image-transient-host.mjs && node test/lark-admission-host.mjs && DSH_TEST_TIMEOUT_MS=240000 node test/lark-recovery-host.mjs"
   },
   "dsh": {
     "bundle": {
@@ -65,7 +67,10 @@
     }
   },
   "files": [
-    "lib",
+    "lib/**/*.js",
+    "lib/**/*.cjs",
+    "lib/**/*.mjs",
+    "lib/vendor/LICENSE",
     "scripts",
     "companion",
     "config.example.json",

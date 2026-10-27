@@ -90,9 +90,33 @@ async function main() {
     if (command === 'lark' && op === 'decrypt') {
       const key = crypto.createHash('sha256').update(String(input.key || ''), 'utf8').digest()
       const encrypted = input.encrypt || ''
-      const iv = key.subarray(0, 16)
-      const plain = aesCbcDecrypt(key, iv, encrypted)
+      const encryptedBuffer = Buffer.from(String(encrypted), 'base64')
+      if (encryptedBuffer.length < 32 || encryptedBuffer.length % 16 !== 0) throw new Error('invalid lark ciphertext')
+      const plain = aesCbcDecrypt(key, encryptedBuffer.subarray(0, 16), encryptedBuffer.subarray(16).toString('base64'))
       return output({ ok: true, json: plain.toString('utf8') })
+    }
+
+    if (command === 'lark' && op === 'verify') {
+      const encryptKey = String(input.encryptKey || '')
+      const timestamp = String(input.timestamp || '')
+      const nonce = String(input.nonce || '')
+      const signature = String(input.signature || '')
+      const rawBody = typeof input.rawBody === 'string' ? input.rawBody : ''
+      if (!encryptKey || !timestamp || !nonce || !signature || !rawBody) {
+        return output({ ok: false, error: 'missing required fields' })
+      }
+      const nowSec = Math.floor(Date.now() / 1000)
+      const timestampSec = Number(timestamp)
+      if (!/^\d+$/.test(timestamp) || !Number.isFinite(timestampSec) || Math.abs(nowSec - timestampSec) > 300) {
+        return output({ ok: false, error: 'timestamp out of range' })
+      }
+      const expected = crypto.createHash('sha256').update(timestamp + nonce + encryptKey + rawBody, 'utf8').digest('hex')
+      const sigBuf = Buffer.from(signature, 'utf8')
+      const expBuf = Buffer.from(expected, 'utf8')
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        return output({ ok: false, error: 'signature mismatch' })
+      }
+      return output({ ok: true })
     }
 
     if (command === 'onebot' && op === 'verify') {

@@ -1,9 +1,11 @@
 require('./_guard.cjs') // 统一超时兜底：挂住即非零退出（见 test/_guard.cjs）
 const path = require('node:path')
 const assert = require('node:assert/strict')
+const { execFileSync } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const { EventEmitter } = require('node:events')
+const { Readable } = require('node:stream')
 const { pathToFileURL } = require('node:url')
 
 const root = path.resolve(__dirname, '..')
@@ -27,7 +29,37 @@ const persistedSessions = new Set()
 const resumedAgents = []
 
 const fsService = {
-  async resolve(filePath) { return { displayPath: filePath, targetKey: filePath } },
+  // E/exec：与宿主同形的 resolve/stat/readBytes（可注入计数器断言零读）。
+  readBytesCalls: 0,
+  async resolve(filePath, opts) {
+    // 与真 dsh-fs-local 同形：signal 中止即 FS_ABORTED；targetKey=canonical
+    // （真实宿主为 realpath 身份，符号链接归一）；displayPath 仅展示。
+    if (opts && opts.signal && opts.signal.aborted) {
+      const error = new Error('resolve aborted')
+      error.code = 'FS_ABORTED'
+      throw error
+    }
+    const displayPath = String(filePath).startsWith('/') ? String(filePath) : '/mock/workspace/' + filePath
+    const targetKey = String(filePath).includes('symlink') ? '/etc/passwd' : displayPath
+    return { displayPath, targetKey }
+  },
+  async stat(target, signal) {
+    // 运行中取消钩子：resolve 成功后、stat 期间 abort（模拟执行中止）。
+    if (String(target.displayPath).includes('midcancel') && typeof fsService.onStatMidcancel === 'function') {
+      fsService.onStatMidcancel()
+    }
+    if (signal && signal.aborted) {
+      const error = new Error('stat aborted')
+      error.code = 'FS_ABORTED'
+      throw error
+    }
+    if (String(target.displayPath).includes('notfile')) return { type: 'directory' }
+    return { type: 'file' }
+  },
+  async readBytes(target) {
+    fsService.readBytesCalls += 1
+    return PNG_1X1
+  },
   async readText(target) {
     const existing = writtenFiles.get(target.displayPath)
     if (existing !== undefined) return existing
@@ -40,6 +72,26 @@ const fsService = {
     return { version: 'v1' }
   },
 }
+const registeredTools = new Map() // agent -> scoped definitions (mock boundary)
+const liveAgents = new Map()
+function installAgentScope(agent, cwd = '/mock/workspace') {
+  agent.session.header = { cwd }
+  const tools = new Map()
+  registeredTools.set(agent, tools)
+  agent.ctx = { get(name) {
+    if (name !== 'tools') return undefined
+    return {
+      register(tool) {
+        assert.equal(tools.has(tool.name), false, 'duplicate scoped registration')
+        tools.set(tool.name, tool)
+        return () => { if (tools.get(tool.name) === tool) tools.delete(tool.name) }
+      },
+      get(name, scope = agent) { return registeredTools.get(scope)?.get(name) },
+    }
+  } }
+  liveAgents.set(agent.id, agent)
+  return agent
+}
 
 
 const fakeShell = {
@@ -49,20 +101,36 @@ const fakeShell = {
   async run(request) {
     shellCalls.push(request)
     if (request.command.includes('crypto-helper.cjs')) {
-      // P5：凭据改从 stdin 的 JSON 读，argv 里不再有 --secret。
-      const input = JSON.parse(request.stdin || '{}')
-      const secret = String(input.secret || '')
-      const crypto = require('node:crypto')
-      const hmac = crypto.createHmac('sha1', secret).update(input.rawBody || '', 'utf8').digest('hex')
-      const expected = 'sha1=' + hmac
-      const match = input.signature === expected
+      // 走真实 companion：飞书 AES/签名回归不能在测试壳里复刻同一份有缺陷逻辑。
+      const command = request.command
+      const args = command.includes("'onebot' 'verify'") ? ['onebot', 'verify']
+        : command.includes("'lark' 'verify'") ? ['lark', 'verify']
+        : command.includes("'lark' 'decrypt'") ? ['lark', 'decrypt']
+        : null
+      assert.ok(args, 'unknown crypto-helper command: ' + command)
+      const stdout = execFileSync(process.execPath, [path.join(root, 'companion', 'crypto-helper.cjs'), ...args], {
+        input: request.stdin || '',
+        encoding: 'utf8',
+      })
       return {
         exitCode: 0,
         signal: null,
         timedOut: false,
         aborted: false,
         timeoutMs: request.timeoutMs || 60000,
-        stdout: { text: JSON.stringify(match ? { ok: true } : { ok: false, error: 'mismatch' }), truncated: false },
+        stdout: { text: stdout, truncated: false },
+        stderr: { text: '', truncated: false },
+      }
+    }
+    // E：飞书业务 POST（含恢复/图片告知）返回真实 code0+message_id（body+marker 约定）。
+    if (String(request.stdin || '').includes('/im/v1/messages')) {
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        aborted: false,
+        timeoutMs: request.timeoutMs || 60000,
+        stdout: { text: '{"code":0,"msg":"ok","data":{"message_id":"om_shell_ok"}}\n__DSH_STATUS__:200', truncated: false },
         stderr: { text: '', truncated: false },
       }
     }
@@ -94,6 +162,21 @@ let larkEventHandler = null
 // 注册的全部 handler（含进单聊空处理器），用例直接调用它模拟 dispatcher 派发。
 const larkHandlers = {}
 const larkClients = []
+// E：视觉能力开关 + 真实附件服务面（typed blocks；与 dsh-attachment 接口同形）。
+const llmModalities = ['text', 'image']
+const PNG_1X1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64')
+const fakeAttachments = {
+  imageLimits: { maxImageBytes: 20 * 1024 * 1024, maxMessageImageBytes: 200 * 1024 * 1024, maxImagesPerMessage: 20 },
+  async validateImage() {},
+  async admitPromptContent(parts) {
+    let n = 0
+    return parts.map((part) => {
+      if (part.type === 'text') return { type: 'text', text: part.text }
+      if (part.type === 'image') return { type: 'image', attachment: { id: 'sha256:fake' + (n++) } }
+      return part
+    })
+  },
+}
 const fakeLarkSdk = {
   LoggerLevel: { info: 'info', debug: 'debug' },
   EventDispatcher: class {
@@ -119,13 +202,51 @@ const fakeLarkSdk = {
       this.closed = true
     }
   },
+  // E：入站图片下载真实调用面（getter 每次读当前 impl，避免缓存吃掉测试切换）。
+  Client: class FakeLarkClient {
+    constructor(params) {
+      this.httpInstance = params && params.httpInstance
+    }
+    get im() {
+      const impl = fakeLarkSdk.__downloadImpl || (() => { throw Object.assign(new Error('reset'), { code: 'ECONNRESET' }) })
+      const api = { get: async (args) => impl(args) }
+      return { v1: { message: api, messageResource: api } }
+    }
+  },
+  __downloadImpl: () => ({ headers: {}, getReadableStream: () => Readable.from([PNG_1X1]) }),
+}
+
+// ── 真实 lark-admission 投影定义的最小宿主 runtime（与真实
+// dsh-session-projection.stateOf 语义一致：已注册无值→init() 默认态）──────
+const projectionDefs = new Map()
+const projectionStates = new Map()
+function projectionSplice(sessionId, message) {
+  const store = projectionStates.get(sessionId) || {}
+  projectionStates.set(sessionId, store)
+  const event = { type: 'agent/inbox/spliced', data: { inserted: [message] } }
+  for (const def of projectionDefs.values()) {
+    const prev = Object.prototype.hasOwnProperty.call(store, def.key) ? store[def.key] : def.init()
+    store[def.key] = def.apply(prev, event)
+  }
 }
 
 const ctx = {
   get(name) {
     if (name === 'dshMessaging.root') return '/mock/workspace'
-    if (name === 'sandboxPolicy') return { workspaceRoot: '/mock/workspace' }
+    if (name === 'sandboxPolicy') {
+      // 真实契约（dsh-sandbox-policy 实源）：resolve({session}) → {mode, workspaceRoot}；
+      // per-call 边界 = session.header.cwd（无 cwd 回部署默认）。
+      return {
+        workspaceRoot: '/mock/workspace',
+        resolve(request = {}) {
+          const session = request.session
+          const cwd = session && session.header && session.header.cwd
+          return { mode: 'workspace-write', workspaceRoot: typeof cwd === 'string' && cwd.includes('narrow') ? '/mock/workspace/narrow' : '/mock/workspace', ...(session ? { sessionId: session.id } : {}) }
+        },
+      }
+    }
     if (name === 'dshMessaging.larkSdk') return fakeLarkSdk
+    if (name === 'attachments') return fakeAttachments // E：真实附件服务面
     if (name === 'dsh.home') return fixtureDshHome
     return undefined
   },
@@ -136,6 +257,16 @@ const ctx = {
     return dispose
   },
   interval() { return () => {} },
+  sessionProjections: {
+    register(definition) { projectionDefs.set(definition.key, definition) },
+    stateOf(session, key) {
+      const def = projectionDefs.get(key)
+      if (!def) return undefined // 未注册=服务缺失 → uncertain（fail-closed）
+      const store = projectionStates.get(session && session.id)
+      return store && Object.prototype.hasOwnProperty.call(store, key) ? store[key] : def.init()
+    },
+    onChanged() { return () => {} },
+  },
   webServer: {
     register(route) {
       // 与真实 dsh-host-webserver 一致：exact 路由重复注册必须抛错。
@@ -147,8 +278,13 @@ const ctx = {
       return () => routes.delete(route.path)
     },
   },
+  // Persistence is mocked here; host integration tests exercise the actual flush.
+  sessions: { async flush(session) { assert.ok(session && session.id); return true } },
   shell: fakeShell,
   fs: fsService,
+  tools: {
+    register() { assert.fail('image tool must never register globally') },
+  },
   // Real compositions always provide this; without it every agent creation logs a
   // "default model selection" error.
   agentDefaultModel: {
@@ -156,6 +292,8 @@ const ctx = {
       return { provider: 'test-provider', model: 'test-model' }
     },
   },
+  // E：视觉能力路由（read_image 同源）。
+  llm: { resolveModelInfo: async () => ({ inputModalities: [...llmModalities] }) },
   agents: {
     // Models the real contract: a durable session id can be created once, and
     // `create` on an existing id rejects while `resume` on a missing one rejects.
@@ -170,12 +308,17 @@ const ctx = {
       persistedSessions.add(id)
       const agent = {
         id,
+        session: { id },
         messages: [],
-        followup(message) { agent.messages.push(message) },
+        followup(message) { agent.messages.push(message); projectionSplice(id, message) },
       }
+      installAgentScope(agent, options.meta?.cwd)
       const handle = {
         agent,
-        async dispose() {},
+        async dispose() {
+          if (liveAgents.get(id) === agent) liveAgents.delete(id)
+          if (listeners['agent/disposed']) await listeners['agent/disposed']({agent})
+        },
       }
       createdAgents.push({ options, agent, handle })
       return handle
@@ -194,28 +337,36 @@ const ctx = {
       }
       const agent = {
         id,
+        session: { id },
         messages: [],
-        followup(message) { agent.messages.push(message) },
+        followup(message) { agent.messages.push(message); projectionSplice(id, message) },
       }
+      installAgentScope(agent, options.meta?.cwd)
       const handle = {
         agent,
-        async dispose() {},
+        async dispose() {
+          if (liveAgents.get(id) === agent) liveAgents.delete(id)
+          if (listeners['agent/disposed']) await listeners['agent/disposed']({agent})
+        },
       }
       resumedAgents.push({ options, agent, handle })
       return handle
     },
     // 宿主的 agents.get(id)：返回当前活着的 agent（真实 dsh-agent 就是这个形状）。
     get(id) {
-      if (sessionBusy.mode !== 'reuse') return undefined
+      if (sessionBusy.mode !== 'reuse') return sessionBusy.mode === 'off' ? liveAgents.get(id) : undefined
       if (!sessionBusy.live || sessionBusy.live.id !== id) {
         sessionBusy.live = {
           id,
+          session: { id },
           messages: [],
-          followup(message) { sessionBusy.live.messages.push(message) },
+          followup(message) { sessionBusy.live.messages.push(message); projectionSplice(sessionBusy.live.id, message) },
         }
       }
+      if (!sessionBusy.live.ctx) installAgentScope(sessionBusy.live)
       return sessionBusy.live
     },
+    list() { return [...liveAgents.values()] },
   },
 }
 
@@ -448,6 +599,7 @@ async function main() {
   assert.equal(JSON.stringify(larkStatus.json).includes('user-token-abc'), false, 'the lark token never leaves over /status')
   assert.equal(JSON.stringify(larkStatus.json).includes('user-encrypt-key-xyz'), false, 'the lark encrypt key never leaves over /status')
   const userToken = 'user-token-abc'
+  const userEncryptKey = 'user-encrypt-key-xyz'
 
   // The persisted record is what the inbound gate reads. The plugin builds this
   // path with POSIX joins, so compare on normalized separators.
@@ -461,29 +613,142 @@ async function main() {
   assert.equal(persisted.adapters.lark.verificationToken, userToken)
   assert.equal(persisted.adapters.lark.encryptKey, 'user-encrypt-key-xyz')
 
-  const larkRoute = routes.get('/messaging/lark/events')
+  let larkRoute = routes.get('/messaging/lark/events')
   assert.ok(larkRoute, 'lark webhook route should be registered once the adapter runs')
 
-  const postLark = async (payload) => {
+  const postLark = async (payload, extraHeaders = {}) => {
     const larkReq = fakeRequest('POST', '/messaging/lark/events', JSON.stringify(payload))
-    larkReq.headers = { 'content-type': 'application/json' }
+    larkReq.headers = Object.assign({ 'content-type': 'application/json' }, extraHeaders)
     const larkRes = fakeResponse()
     await larkRoute(larkReq, larkRes)
     await tick()
     return larkRes
   }
 
-  const challengeDenied = await postLark({ type: 'url_verification', token: 'wrong', challenge: 'c1' })
-  assert.equal(challengeDenied.statusCode, 401, 'challenge with wrong token must be refused')
+  const larkCrypto = require('node:crypto')
+  const larkEncrypt = (payload) => {
+    const key = larkCrypto.createHash('sha256').update(userEncryptKey, 'utf8').digest()
+    const iv = larkCrypto.randomBytes(16)
+    const cipher = larkCrypto.createCipheriv('aes-256-cbc', key, iv)
+    return Buffer.concat([iv, cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]).toString('base64')
+  }
+  const larkSignedHeaders = (rawBody, { timestamp = Math.floor(Date.now() / 1000), nonce = larkCrypto.randomBytes(16).toString('hex') } = {}) => {
+    const signature = larkCrypto.createHash('sha256')
+      .update(String(timestamp) + nonce + userEncryptKey + rawBody, 'utf8')
+      .digest('hex')
+    return {
+      'x-lark-request-timestamp': String(timestamp),
+      'x-lark-request-nonce': nonce,
+      'x-lark-signature': signature,
+    }
+  }
 
-  const challengeOk = await postLark({ type: 'url_verification', token: userToken, challenge: 'c1' })
-  assert.equal(challengeOk.statusCode, 200, 'the challenge is answered after the token matches')
-  assert.equal(JSON.parse(challengeOk.body).challenge, 'c1', 'challenge must be echoed for address verification')
+  // 官方 SDK autoChallenge 允许加密 legacy challenge 不带签名；本分支仅限解密成功、
+  // type=url_verification、token 匹配，普通加密事件仍必须签名。
+  const legacyEncryptedChallengeBody = {
+    encrypt: larkEncrypt({ type: 'url_verification', token: userToken, challenge: 'legacy-encrypted-c1' }),
+  }
+  const legacyEncryptedChallenge = await postLark(legacyEncryptedChallengeBody)
+  assert.equal(legacyEncryptedChallenge.statusCode, 200, 'a valid legacy encrypted challenge without a signature must be answered')
+  assert.equal(JSON.parse(legacyEncryptedChallenge.body).challenge, 'legacy-encrypted-c1')
+  const replayedLegacyChallenge = await postLark(legacyEncryptedChallengeBody)
+  assert.equal(replayedLegacyChallenge.statusCode, 200, 'a valid legacy challenge retry must be acknowledged')
+  assert.equal(JSON.parse(replayedLegacyChallenge.body).challenge, 'legacy-encrypted-c1', 'a challenge retry must echo the same challenge')
 
-  // An encrypted payload is decrypted with the user's key; undecryptable ciphertext
-  // is refused rather than passed through.
+  const encryptedV2Challenge = (topToken, headerToken) => larkEncrypt({
+    schema: '2.0',
+    token: topToken,
+    header: { event_id: 'ev_enc_challenge', event_type: 'url_verification', token: headerToken },
+    event: {},
+    challenge: 'v2-conflict',
+  })
+  const topCorrectHeaderWrongBody = { encrypt: encryptedV2Challenge(userToken, 'wrong') }
+  const topCorrectHeaderWrong = await postLark(
+    topCorrectHeaderWrongBody,
+    larkSignedHeaders(JSON.stringify(topCorrectHeaderWrongBody)),
+  )
+  assert.equal(topCorrectHeaderWrong.statusCode, 401, 'v2 must treat header.token as authoritative even when the top token is correct')
+
+  const topWrongHeaderCorrectBody = { encrypt: encryptedV2Challenge('wrong', userToken) }
+  const topWrongHeaderCorrect = await postLark(
+    topWrongHeaderCorrectBody,
+    larkSignedHeaders(JSON.stringify(topWrongHeaderCorrectBody)),
+  )
+  assert.equal(topWrongHeaderCorrect.statusCode, 200, 'v2 must accept the correct authoritative header.token')
+  assert.equal(JSON.parse(topWrongHeaderCorrect.body).challenge, 'v2-conflict')
+
+  const headerMissingBody = {
+    encrypt: larkEncrypt({
+      schema: '2.0',
+      token: userToken,
+      header: { event_id: 'ev_no_header_token', event_type: 'url_verification' },
+      event: {},
+      challenge: 'missing-header-token',
+    }),
+  }
+  const headerMissing = await postLark(headerMissingBody, larkSignedHeaders(JSON.stringify(headerMissingBody)))
+  assert.equal(headerMissing.statusCode, 401, 'v2 without header.token must not fall back to the top token')
+
+  const signatureDeniedBody = { encrypt: larkEncrypt({ type: 'url_verification', token: userToken, challenge: 'signed-failure' }) }
+  const signatureDenied = await postLark(signatureDeniedBody, Object.assign(
+    larkSignedHeaders(JSON.stringify(signatureDeniedBody), { nonce: larkCrypto.randomBytes(16).toString('hex') }),
+    { 'x-lark-signature': '0'.repeat(64) },
+  ))
+  assert.equal(signatureDenied.statusCode, 401, 'an encrypted payload with a bad signature must be refused')
+
+  const staleDeniedBody = { encrypt: larkEncrypt({ type: 'url_verification', token: userToken, challenge: 'stale' }) }
+  const staleDenied = await postLark(staleDeniedBody, larkSignedHeaders(
+    JSON.stringify(staleDeniedBody),
+    { timestamp: Math.floor(Date.now() / 1000) - 301 },
+  ))
+  assert.equal(staleDenied.statusCode, 401, 'an encrypted payload older than the timestamp window must be refused')
+
+  const missingNonceBody = { encrypt: larkEncrypt({ type: 'url_verification', token: userToken, challenge: 'no-nonce' }) }
+  const missingNonceHeaders = larkSignedHeaders(JSON.stringify(missingNonceBody))
+  delete missingNonceHeaders['x-lark-request-nonce']
+  const missingNonce = await postLark(missingNonceBody, missingNonceHeaders)
+  assert.equal(missingNonce.statusCode, 401, 'an encrypted payload without a nonce must be refused')
+
+  // Undecryptable ciphertext is refused rather than passed through.
   const badCipher = await postLark({ encrypt: 'not-valid-ciphertext' })
   assert.equal(badCipher.statusCode, 401, 'an undecryptable payload must be refused')
+  const badCipherRetry = await postLark({ encrypt: 'not-valid-ciphertext' })
+  assert.equal(badCipherRetry.statusCode, 401, 'a failed decrypt retry must not become a successful replay')
+
+  const wrongTokenBody = { encrypt: larkEncrypt({ type: 'url_verification', token: 'wrong', challenge: 'wrong-token' }) }
+  const wrongTokenHeaders = larkSignedHeaders(JSON.stringify(wrongTokenBody))
+  const wrongToken = await postLark(wrongTokenBody, wrongTokenHeaders)
+  assert.equal(wrongToken.statusCode, 401, 'a correctly signed encrypted challenge with the wrong token must be refused')
+  const wrongTokenRetry = await postLark(wrongTokenBody, wrongTokenHeaders)
+  assert.equal(wrongTokenRetry.statusCode, 401, 'a failed token retry must not become a successful replay')
+
+  const agentsBeforeEncrypted = createdAgents.length
+  const encryptedMessageBody = {
+    encrypt: larkEncrypt({
+      schema: '2.0',
+      header: { event_id: 'ev_enc_message', event_type: 'im.message.receive_v1', token: userToken },
+      event: {
+        sender: { sender_id: { open_id: 'ou_enc' }, sender_type: 'user' },
+        message: {
+          message_id: 'om_enc',
+          chat_id: 'oc_enc',
+          message_type: 'text',
+          content: JSON.stringify({ text: 'encrypted v2 message' }),
+        },
+      },
+    }),
+  }
+  const encryptedMessageHeaders = larkSignedHeaders(JSON.stringify(encryptedMessageBody))
+  const encryptedMessage = await postLark(encryptedMessageBody, encryptedMessageHeaders)
+  assert.equal(encryptedMessage.statusCode, 200, 'a signed encrypted v2 message must be accepted')
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(createdAgents.length, agentsBeforeEncrypted + 1, 'an encrypted v2 message must reach an agent')
+  assert.equal(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, 'encrypted v2 message')
+
+  const replayedMessage = await postLark(encryptedMessageBody, encryptedMessageHeaders)
+  assert.equal(replayedMessage.statusCode, 200, 'a legitimate message retry must be acknowledged')
+  assert.equal(JSON.parse(replayedMessage.body).replayed, true, 'a legitimate message retry must be marked as replayed')
+  assert.equal(createdAgents.length, agentsBeforeEncrypted + 1, 'a replayed event must not be dispatched again')
 
   // Plaintext inbound requires the Feishu side to run without an Encrypt Key, so
   // clear it before exercising the message path (the key case is asserted above).
@@ -493,6 +758,15 @@ async function main() {
   // settings 通道里的清空语义是 op:'unset'（见 test/config-migration.cjs 场景 4b）。
   await saveConfig(plaintextConfig)
   await tick()
+  larkRoute = routes.get('/messaging/lark/events')
+  assert.ok(larkRoute, 'lark webhook route must be re-registered after the config reload')
+
+  const challengeDenied = await postLark({ type: 'url_verification', token: 'wrong', challenge: 'c1' })
+  assert.equal(challengeDenied.statusCode, 401, 'challenge with wrong token must be refused')
+
+  const challengeOk = await postLark({ type: 'url_verification', token: userToken, challenge: 'c1' })
+  assert.equal(challengeOk.statusCode, 200, 'the challenge is answered after the token matches')
+  assert.equal(JSON.parse(challengeOk.body).challenge, 'c1', 'challenge must be echoed for address verification')
 
   const agentsBeforeLark = createdAgents.length
   const larkMessage = await postLark({
@@ -512,7 +786,6 @@ async function main() {
   const agentsBeforeV2 = createdAgents.length
   const v2Webhook = await postLark({
     schema: '2.0',
-    token: userToken,
     header: { event_id: 'ev_2', event_type: 'im.message.receive_v1', token: userToken },
     event: {
       sender: { sender_id: { open_id: 'ou_sender' }, sender_type: 'user' },
@@ -554,7 +827,7 @@ async function main() {
           title: 'post-title',
           content: [
             [{ tag: 'text', text: 'line-1' }],
-            [{ tag: 'img', image_key: 'img-key-not-text' }],
+            [{ tag: 'img', image_key: 'img_v3_nottext' }],
             [{ tag: 'a', text: 'link-label', href: 'https://example.invalid/x' }],
           ],
         }),
@@ -562,16 +835,58 @@ async function main() {
     },
   })
   assert.equal(postEvent.statusCode, 200)
-  await new Promise((r) => setTimeout(r, 20))
+  // E 定点：显式等待 claim/管线终态（不猜固定延时）；失败时输出最少合成上下文。
+  const ddH = await import(pathToFileURL(path.join(root, 'lib', 'lark-dedup.js')).href)
+  const leaseH = await ddH.openLarkDedupStore(path.join(fixtureDshHome, 'lark-dedup'))
+  let recPost = null
+  for (let i = 0; i < 80; i += 1) {
+    await new Promise((r) => setTimeout(r, 50))
+    recPost = leaseH.get(ddH.larkDedupKey('cli_test', 'om_post'))
+    if (recPost && (recPost.state === 'delivered' || recPost.state === 'rejected')) break
+  }
+  const agentsDeltaPost = createdAgents.length - agentsBeforePost
+  if (!recPost || recPost.state !== 'delivered') {
+    const stD = await invoke('GET', '/__dsh-messaging/status')
+    assert.fail('E-DBG rec=' + JSON.stringify(recPost && { st: recPost.state, e: recPost.error, sx: recPost.sessionExisted, sid: Boolean(recPost.sessionId) })
+      + ' agentsDelta=' + agentsDeltaPost
+      + ' msgs=' + (agentsDeltaPost > 0 ? createdAgents[createdAgents.length - 1].agent.messages.length : -1)
+      + ' errs=' + JSON.stringify((stD.json.errors || []).slice(-5).map((e) => String(e.message).slice(0, 110)))
+      + ' recov=' + JSON.stringify((stD.json.recent || []).filter((e) => e.kind === 'lark-recovery').slice(-5)))
+  }
+  await leaseH.close()
   assert.equal(createdAgents.length, agentsBeforePost + 1, 'a rich text post must reach an agent')
-  assert.equal(
-    createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text,
-    'post-title\nline-1\nlink-label',
-    'post is flattened to plain text (elements without text are skipped)',
-  )
+  const postBlocks = createdAgents[createdAgents.length - 1].agent.messages[0].content
+  assert.deepEqual(postBlocks.filter((b) => b.type === 'text').map((b) => b.text), ['post-title', 'line-1', 'link-label'], 'E：post 文本按原顺序保留（title/文本/链接）')
+  assert.equal(postBlocks.filter((b) => b.type === 'image').length, 1, 'E：post 图片进统一管线 typed block（不静默丢图）')
+  // E：纯文本 post（无图）→ 原文本路径（无视觉/附件服务也入队；larkPostText 保真）
+  const agentsBeforePostTxt = createdAgents.length
+  const postTextEvent = await postLark({
+    token: userToken,
+    event: {
+      type: 'im.message.receive_v1',
+      message: {
+        message_id: 'om_posttxt',
+        message_type: 'post',
+        chat_id: 'oc_posttxt',
+        chat_type: 'p2p',
+        content: JSON.stringify({ title: '纯文本标题', content: [[{ tag: 'text', text: '第一行' }], [{ tag: 'a', text: '链接', href: 'https://example.invalid/y' }]] }),
+      },
+    },
+  })
+  assert.equal(postTextEvent.statusCode, 200)
+  let postTxtMsg = null
+  for (let i = 0; i < 80; i += 1) {
+    await new Promise((r) => setTimeout(r, 50))
+    const last = createdAgents[createdAgents.length - 1]
+    if (last && createdAgents.length > agentsBeforePostTxt && last.agent.messages.length) { postTxtMsg = last.agent.messages[0]; break }
+  }
+  assert.ok(postTxtMsg, 'E：纯文本 post 即使无视觉/附件也沿原文本入队（显式完成条件）')
+  assert.equal(postTxtMsg.content[0].type, 'text', 'E：纯文本 post 走文本 content（非 blocks 图片管线）')
+  assert.ok(postTxtMsg.content[0].text.includes('纯文本标题') && postTxtMsg.content[0].text.includes('第一行') && postTxtMsg.content[0].text.includes('链接'), 'E：larkPostText 保真（标题/多行/链接）')
   assert.equal((await larkDrops()).length, 0, 'a delivered post produces no drop record')
 
-  // 2) 图片消息（content 里没有文本）→ 不支持的类型，只留元数据。
+  // 2) 图片消息（E）：不再丢弃/不记 drop；入统一管线（下载临时失败→claimed 可见
+  // pending，整条不部分准入）；payload（image_key）绝不进 recent/错误。
   const imageEvent = await postLark({
     token: userToken,
     event: {
@@ -581,18 +896,71 @@ async function main() {
         message_type: 'image',
         chat_id: 'oc_img',
         chat_type: 'p2p',
-        content: JSON.stringify({ image_key: 'img-key-secret' }),
+        content: JSON.stringify({ image_key: 'img_v3_secret' }),
       },
     },
   })
   assert.equal(imageEvent.statusCode, 200)
   await tick()
-  const imageDrop = (await larkDrops())[0]
-  assert.equal(imageDrop.reason, 'unsupported message_type')
-  assert.equal(imageDrop.messageType, 'image')
-  assert.equal(imageDrop.chatType, 'p2p')
-  assert.equal(imageDrop.textLen, null)
-  assert.equal(JSON.stringify(imageDrop).includes('img-key-secret'), false, 'a drop record must never carry the payload')
+  const imageDrop = (await larkDrops()).find((d) => d.messageType === 'image')
+  assert.equal(imageDrop, undefined, 'E：image 不再按不支持类型丢弃（走统一管线）')
+  const stImg = await invoke('GET', '/__dsh-messaging/status')
+  assert.ok(!JSON.stringify(stImg.json).includes('img_v3_secret'), 'a drop/status record must never carry the payload')
+  // ── E/exec：真实注册工具的 file_path 权限链（per-call policy / regular / 零读 / 零派发）──
+  {
+    const agentP = createdAgents[createdAgents.length - 1].agent // 已绑定 lark 会话（真实绑定证据）
+    // 工具读 exec.agent.session（宿主契约）：从真实 agent 派生 session/cwd。
+    const tool = registeredTools.get(agentP)?.get('lark_send_image')
+    assert.ok(tool, 'E：图片工具注册在绑定 agent 作用域')
+    const runTool = (args, extra = {}) => tool.execute(args, { agent: agentP, callId: 'ct-' + Math.random(), ...extra })
+    // 1) policy 越界：读取前拒绝，零读
+    const before1 = fsService.readBytesCalls
+    const esc = await runTool({ file_path: '/etc/passwd' })
+    assert.equal(esc.reason, 'resolve_failed', 'policy 越界在任何读取前拒绝（fail-closed）')
+    assert.equal(fsService.readBytesCalls, before1, '越界零读')
+    // 2) 非 regular file：stat 前置拒绝，零读
+    const nf = await runTool({ file_path: 'notfile.png' })
+    assert.equal(nf.reason, 'resolve_failed', '非 regular file 拒绝')
+    assert.equal(fsService.readBytesCalls, before1, '零读（stat 前置）')
+    // 2b) 符号链接逃逸（真实契约：displayPath 在 root 内但 targetKey=canonical 出界）
+    const symBefore = fsService.readBytesCalls
+    const sym = await runTool({ file_path: 'symlink.png' })
+    assert.equal(sym.reason, 'resolve_failed', 'canonical(targetKey) 越界拒绝（displayPath 不作边界）')
+    assert.equal(fsService.readBytesCalls, symBefore, '符号链接逃逸零读')
+    // 3) 预先取消：零派发（无成功结果、无 wire）
+    const shellBefore = shellCalls.length
+    const pre = await runTool({ file_path: 'img.png' }, { signal: AbortSignal.abort() })
+    assert.notEqual(pre.ok, true, '预先取消不产生成功派发')
+    assert.equal(shellCalls.length, shellBefore, '预先取消零 wire')
+    // 4) 合法路径：恰一次受限读（链路抵达上传阶段；发送成功真 wire 另有 SDK 套件）
+    const before4 = fsService.readBytesCalls
+    const chain = await runTool({ file_path: 'img.png' })
+    assert.equal(fsService.readBytesCalls, before4 + 1, '合法路径恰好一次受限读（got reason=' + chain.reason + ' category=' + chain.category + '）')
+    assert.notEqual(chain.ok, true, 'fake 上传面不完整：链路到达上传即证明权限链已闭合')
+    // 5) 未绑定会话：先于任何 fs 调用拒绝
+    const before5 = fsService.readBytesCalls
+    const unb = await runTool({ file_path: 'img.png' }, { agent: { session: { id: 'sess-unbound-tool', header: { cwd: '/mock/workspace' } } } })
+    assert.equal(unb.reason, 'not_bound_to_lark', '未绑定会话先拒')
+    assert.equal(fsService.readBytesCalls, before5, '未绑定零读')
+    // 6) per-call 策略隔离（真实契约 resolve({session})）：窄会话 cwd → 同名文件出界拒、零读
+    const pcBefore = fsService.readBytesCalls
+    const originalCwd = agentP.session.header.cwd
+    agentP.session.header.cwd = '/mock/workspace/narrow'
+    const percall = await runTool({ file_path: 'img.png' })
+    agentP.session.header.cwd = originalCwd
+    assert.equal(percall.reason, 'resolve_failed', 'per-call 窄会话 cwd 拒绝（resolve 权威生效）')
+    assert.equal(fsService.readBytesCalls, pcBefore, 'per-call 拒绝零读')
+    // 7) 运行中取消：resolve 成功后 stat 期间 abort → 零读零上传零派发
+    const midCtl = new AbortController()
+    fsService.onStatMidcancel = () => midCtl.abort()
+    const midBefore = fsService.readBytesCalls
+    const midShell = shellCalls.length
+    const mid = await runTool({ file_path: 'midcancel.png' }, { signal: midCtl.signal })
+    fsService.onStatMidcancel = null
+    assert.equal(mid.reason, 'resolve_failed', 'stat 期间取消 → 拒绝（零后续）')
+    assert.equal(fsService.readBytesCalls, midBefore, '运行中取消零读')
+    assert.equal(shellCalls.length, midShell, '运行中取消零上传/零派发')
+  }
 
   // 3) 空文本 → no text（长度如实记录，文本本身不记）。
   const emptyEvent = await postLark({
@@ -604,7 +972,7 @@ async function main() {
   })
   assert.equal(emptyEvent.statusCode, 200)
   await tick()
-  const emptyDrop = (await larkDrops())[1]
+  const emptyDrop = (await larkDrops()).find((d) => d.reason === 'no text')
   assert.equal(emptyDrop.reason, 'no text')
   assert.equal(emptyDrop.textLen, 3, 'the whitespace length is recorded, the text is not')
 
@@ -618,7 +986,7 @@ async function main() {
   })
   assert.equal(noChatEvent.statusCode, 200)
   await tick()
-  const noChatDrop = (await larkDrops())[2]
+  const noChatDrop = (await larkDrops()).find((d) => d.reason === 'no chatId')
   assert.equal(noChatDrop.reason, 'no chatId')
   assert.equal(noChatDrop.textLen, 'no-chat-id-body'.length)
   assert.equal(JSON.stringify(noChatDrop).includes('no-chat-id-body'), false, 'the text itself is never recorded')
@@ -626,12 +994,13 @@ async function main() {
   // 5) 缺 message；6) 非消息事件。
   assert.equal((await postLark({ token: userToken, event: { type: 'im.message.receive_v1' } })).statusCode, 200)
   await tick()
-  assert.equal((await larkDrops())[3].reason, 'no message')
+  assert.ok((await larkDrops()).some((d) => d.reason === 'no message'), 'no message produces a drop')
   assert.equal((await postLark({ token: userToken, event: { type: 'im.chat.access_event.v1' } })).statusCode, 200)
   await tick()
   const allDrops = await larkDrops()
-  assert.equal(allDrops.length, 5, 'every dropped branch leaves exactly one trace')
-  assert.equal(allDrops[4].reason, 'not im.message.receive_v1')
+  // E 语义：image 走统一管线不再丢弃 → 4 支（no-text/no-chat/no-message/非本事件）。
+  assert.equal(allDrops.length, 4, 'every dropped branch leaves exactly one trace（image 不再入 drop）')
+  assert.equal(allDrops[3].reason, 'not im.message.receive_v1')
   assert.equal(allDrops.some((entry) => JSON.stringify(entry).includes('line-1')), false, 'no drop record ever contains message text')
 
   // Long connection (WebSocket) subscription: appId + appSecret only, authenticated

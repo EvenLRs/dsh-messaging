@@ -5,8 +5,13 @@ const path = require('node:path')
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
 const { pathToFileURL } = require('node:url')
+const fs = require('node:fs')
+const os = require('node:os')
 
 const root = path.resolve(__dirname, '..')
+// 隔离 fixture（仅测试夹具）：注入 mkdtemp dsh.home，确保未来启用 lark 时
+// warm 的去重账本只落临时根，绝不触真实 profile（不改任何业务断言）。
+const fixtureDshHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-http-routes-'))
 
 const routes = new Map()
 const writtenFiles = new Map()
@@ -19,6 +24,7 @@ const ctx = {
   get(name) {
     if (name === 'dshMessaging.root') return '/mock/workspace'
     if (name === 'sandboxPolicy') return { workspaceRoot: '/mock/workspace' }
+    if (name === 'dsh.home') return fixtureDshHome
     return undefined
   },
   on() { return () => {} },
