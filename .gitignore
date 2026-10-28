@@ -9,3 +9,5 @@ node_modules/
 package-lock.json
 verify-lark.ps1
 /.implementation-plan.md
+/AGENTS.md
+/CHANGELOG.md
