@@ -251,9 +251,9 @@ async function main() {
   })
   plugin.apply(ctx)
 
-  const section = registrations.find((entry) => entry.options.name === 'plugins.row.config')
+  const section = registrations.find((entry) => entry.options.name === 'settings.section')
   assert.ok(section, 'the plugin page must be registered')
-  assert.equal(registrations.some((entry) => entry.options.name === 'settings.section'), false, 'settings.section is gone')
+  assert.equal(section.options.id, 'messaging', 'native Messaging section owns configuration and login')
   // 宿主把 inject 面绑成 props（hooks → useXxx(selector)），这里模拟它。
   const pageFace = section.options.inject()
 

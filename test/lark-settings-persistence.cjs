@@ -311,8 +311,24 @@ async function main() {
   assert.equal(plain(h.entry().fiber.config).runtime.nodePath, '', 'nodePath 已恢复，不留测试残留')
   assert.equal(Boolean(h.describeValue().value.adapters.lark.interactiveCard), false, '最终回读 false')
 
+  // 0.3.3 newly surfaced defaults/capacity are actually volatile writable Host fields.
+  const defaultsOps = [
+    { op: 'set', path: ['agent', 'agentPreset'], value: 'standard' },
+    { op: 'set', path: ['agent', 'cwd'], value: profileHome },
+    { op: 'set', path: ['agent', 'provider'], value: 'fixture-provider' },
+    { op: 'set', path: ['agent', 'model'], value: 'fixture-model' },
+    { op: 'set', path: ['adapters', 'lark', 'sendCapacity'], value: 3000 },
+  ]
+  await h.ctx.settings.mutate(ENTRY_ID, defaultsOps, h.describeValue().revision)
+  await settle(); await settle()
+  const defaultsView = h.describeValue().value
+  for (const op of defaultsOps) {
+    const read = (root) => op.path.reduce((node, key) => node[key], root)
+    assert.equal(read(defaultsView), op.value, 'new UI field is accepted by real SettingsForms')
+    assert.equal(read(readDiskConfig()), op.value, 'new UI field persisted to synthetic profile disk')
+  }
   fs.rmSync(home, { recursive: true, force: true })
-  console.log('lark-settings-persistence: ok (false→true→disk true→warm/cold reload true→false→disk false→cold reload false)')
+  console.log('lark-settings-persistence: ok (false→true→disk true→warm/cold reload true→false→disk false→cold reload false; agent defaults + sendCapacity accepted/persisted)')
   // 宿主侧 fiber 会留定时器，成功/失败都直接退出，不挂 npm test。
   process.exit(0)
 }

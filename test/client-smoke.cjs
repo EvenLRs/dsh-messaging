@@ -23,7 +23,7 @@ assert.match(clientSource, /window\.__ModuleLoader__\.load/)
 assert.doesNotMatch(clientSource, /__dsh-messaging\/config/, 'the page must not talk to the legacy config route')
 assert.match(clientSource, /\/__dsh-messaging\/status/)
 assert.match(clientSource, /plugins\.row\.config/, 'the row config slot must be registered')
-assert.doesNotMatch(clientSource, /slots\.inject\('settings\.section'/, 'settings.section must be gone')
+assert.match(clientSource, /slots\.inject\('settings\.section'/, 'Messaging must be registered in native Settings')
 assert.match(clientSource, /credentials: 'same-origin'/)
 assert.match(clientSource, /diagnostics\/refresh-scope/, 'the read-only scope refresh endpoint is wired')
 assert.doesNotMatch(clientSource, /host\.call/)
@@ -186,7 +186,7 @@ function componentBody(source, name) {
   const at = source.indexOf('function ' + name + '(')
   if (at === -1) return ''
   const rest = source.slice(at + 1)
-  const endMarkers = [/\n        function /, /\n        slots\.inject\(/, /\n    exports\.name/]
+  const endMarkers = [/\n        function /, /\n        slots\.inject\(/, /\n        ctx\.effect\(/, /\n    exports\.name/]
   let cut = rest.length
   for (const marker of endMarkers) {
     const found = rest.search(marker)
@@ -582,13 +582,16 @@ async function main() {
   assert.equal(calls.length, 0, 'apply itself must not fetch')
 
   // ── P3-1：注册的是 plugins.row.config，key 正确，且 settings.section 已消失 ──
-  const rowEntry = registrations.find((entry) => entry.options.name === 'plugins.row.config')
+  const diagnosticsEntry = registrations.find((entry) => entry.options.name === 'plugins.row.config')
+  assert.equal(diagnosticsEntry.options.key, 'dsh-messaging#dsh-messaging')
+  const rowEntry = registrations.find((entry) => entry.options.name === 'settings.section')
   assert.ok(rowEntry, 'the row config slot must be registered')
-  assert.equal(rowEntry.options.key, 'dsh-messaging#dsh-messaging', 'the row key follows cordis.patch.yml (id: dsh-messaging)')
+  assert.equal(rowEntry.options.id, 'messaging')
+  assert.equal(rowEntry.options.label, 'Messaging')
   assert.equal(
     registrations.some((entry) => entry.options.name === 'settings.section'),
-    false,
-    'settings.section must no longer be registered',
+    true,
+    'Messaging is registered as a settings section',
   )
   const panel = registrations.find((entry) => entry.options.name === 'tool.view.cordis')
   assert.ok(panel, 'the status panel stays for P4')
@@ -616,21 +619,21 @@ async function main() {
   }
 
   resetState()
-  const summary = render(rowEntry.component, pageProps({ view: 'summary' }))
+  const summary = render(diagnosticsEntry.component, bindFace(diagnosticsEntry.options.inject(), { view: 'summary' }, dicts, React))
   assert.match(
     treeText(summary),
-    /Configure message channels, QR login and inbound credentials/,
+    /Connection and Feishu permission diagnostics/,
     'the summary one-liner renders',
   )
 
   let tree = await renderPage()
   let text = treeText(tree)
-  assert.match(text, /Message Channel Configuration/)
+  assert.match(text, /Messaging/)
   assert.match(text, /OneBot v11/)
   assert.match(text, /Telegram/)
   assert.match(text, /Personal WeChat/)
   assert.ok(hasAttr(tree, 'data-official'), 'the official SettingsForm shell is used when ui-primitives resolves')
-  assert.equal(calls.length, 0, 'no config fetch while rendering the page')
+  assert.ok(calls.every((call) => call.method === 'GET'), 'configuration rendering may read status but must not send or refresh scopes')
 
   // ── P3-2b：飞书交互式卡片用 Yes/No 下拉，默认 false ────────────────────
   assert.equal(dicts['dsh-messaging'].zh['field.lark.interactiveCard'], '是否启用交互式卡片')
@@ -655,7 +658,7 @@ async function main() {
     const walk = (node, insideLark) => {
       if (!node || typeof node !== 'object') return
       if (Array.isArray(node)) return node.forEach((child) => walk(child, insideLark))
-      const inLark = insideLark || (node.type === 'details' && node.props && node.props.key === 'lark')
+      const inLark = insideLark || (node.type === 'section' && node.props && node.props.key === 'lark')
       if (inLark && node.type === 'input') count += 1
       const kids = []
       if (node.props && node.props.children != null) kids.push(node.props.children)
@@ -715,7 +718,7 @@ async function main() {
   clearButton.props.onClick()
   await flush()
   tree = rerender()
-  assert.ok(findInputByPlaceholder(tree, 'Cleared when you save'), 'the pending clear is announced')
+  assert.ok(findInputByPlaceholder(tree, 'User override removed on save; composition defaults may remain'), 'the pending clear is announced')
   findButton(tree, 'Save').props.onClick()
   await flush()
   assert.deepEqual(JSON.parse(JSON.stringify(mutateCalls[2].ops)), [
@@ -793,7 +796,7 @@ async function main() {
   })
   const fallbackCtxBundle = makeCtx({ row: configFormsRow })
   fallbackPlugin.apply(fallbackCtxBundle.ctx)
-  const fallbackEntry = fallbackCtxBundle.registrations.find((entry) => entry.options.name === 'plugins.row.config')
+  const fallbackEntry = fallbackCtxBundle.registrations.find((entry) => entry.options.name === 'settings.section')
   assert.ok(fallbackEntry, 'the page registers even without ui-primitives')
   fallbackReact.resetCursor()
   const fallbackTree = render(fallbackEntry.component, bindFace(fallbackEntry.options.inject(), { view: 'page', form }, dicts, fallbackReact))
@@ -808,6 +811,11 @@ async function main() {
   }
 
   // ── P4：StatusController 没有订阅者时不发请求，最后一个退订后停掉 interval ─
+  // Unmount settings/fallback hook consumers before testing the shared status lifetime.
+  for (const off of HOOK_SUBSCRIPTIONS.values()) off()
+  HOOK_SUBSCRIPTIONS.clear()
+  intervals.length = 0
+  calls.length = 0
   const statusFace = panel.options.inject()
   const statusStore = statusFace.hooks.status
   assert.equal(typeof statusFace.reload, 'function', 'the panel inject carries the reload action')
