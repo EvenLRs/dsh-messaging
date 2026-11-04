@@ -1,6 +1,4 @@
 import './_guard.cjs'
-import './lark-quote-acceptance.mjs'
-import './messaging-quote-freshness.mjs'
 import { renderInteractionResult } from '../lib/messaging-interaction-tools.js'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
