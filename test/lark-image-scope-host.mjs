@@ -65,7 +65,7 @@ async function main() {
     wire.lastUrl = url
     if (url.includes('/auth/v3/tenant_access_token')) return { data: { code: 0, tenant_access_token: 't-1', expire: 7200 }, status: 200, headers: {}, config }
     if (url.includes('/im/v1/images')) { wire.uploads += 1; return { data: { code: 0, data: { image_key: 'img_v3_real' } }, status: 200, headers: {}, config } }
-    if (url.includes('/im/v1/messages') && String(config.method).toLowerCase()==='get') return {data:{code:0,data:{items:[{msg_type:'text',body:{content:JSON.stringify({text:'synthetic recovered'})}}]}},status:200,headers:{},config}
+    if (url.includes('/im/v1/messages') && String(config.method).toLowerCase()==='get') return {data:{code:0,data:{items:[{message_id:'om_cold_scope',chat_id:'oc_rt1',create_time:String(Date.now()),msg_type:'text',body:{content:JSON.stringify({text:'synthetic recovered'})}}]}},status:200,headers:{},config}
     if (url.includes('/im/v1/messages')) { wire.sends += 1; classify(config.data); return { data: { code: 0, data: { message_id: 'om_real_1' } }, status: 200, headers: {}, config } }
     const err = new Error('unexpected feishu url ' + url); throw err
   }
@@ -77,7 +77,7 @@ async function main() {
       let body = '{"code":0,"data":{"message_id":"om_real_1"}}'
       if (stdin.includes('/open-apis/auth/')) body = '{"code":0,"tenant_access_token":"t-1","expire":7200}'
       else if (stdin.includes('/im/v1/images')) { wire.uploads += 1; body = '{"code":0,"data":{"image_key":"img_v3_real"}}' }
-      else if (stdin.includes('/im/v1/messages/om_cold_scope')) body = JSON.stringify({code:0,data:{items:[{msg_type:'text',body:{content:JSON.stringify({text:'synthetic recovered'})}}]}})
+      else if (stdin.includes('/im/v1/messages/om_cold_scope')) body = JSON.stringify({code:0,data:{items:[{message_id:'om_cold_scope',chat_id:'oc_rt1',create_time:String(Date.now()),msg_type:'text',body:{content:JSON.stringify({text:'synthetic recovered'})}}]}})
       else if (stdin.includes('/im/v1/messages')) {
         wire.sends += 1
         const line = stdin.split('\n').find(line => line.startsWith('data-binary = '))

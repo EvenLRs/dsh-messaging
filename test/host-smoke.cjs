@@ -743,7 +743,7 @@ async function main() {
   assert.equal(encryptedMessage.statusCode, 200, 'a signed encrypted v2 message must be accepted')
   await new Promise((r) => setTimeout(r, 20))
   assert.equal(createdAgents.length, agentsBeforeEncrypted + 1, 'an encrypted v2 message must reach an agent')
-  assert.equal(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, 'encrypted v2 message')
+  assert.match(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, /^encrypted v2 message\n\n\[Messaging host metadata\]\n\[message ref: msgref_[a-f0-9]{40}\]$/)
 
   const replayedMessage = await postLark(encryptedMessageBody, encryptedMessageHeaders)
   assert.equal(replayedMessage.statusCode, 200, 'a legitimate message retry must be acknowledged')
@@ -779,7 +779,7 @@ async function main() {
   assert.equal(larkMessage.statusCode, 200)
   await new Promise((r) => setTimeout(r, 20))
   assert.equal(createdAgents.length, agentsBeforeLark + 1, 'a token-authenticated lark message should reach an agent')
-  assert.equal(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, 'hi from lark')
+  assert.match(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, /^hi from lark\n\n\[Messaging host metadata\]\n\[message ref: msgref_[a-f0-9]{40}\]$/)
 
   // The same event may arrive in the v2 shape (schema/header/event), which is what the
   // current Feishu platform sends. The body then sits under event.event.
@@ -800,7 +800,7 @@ async function main() {
   assert.equal(v2Webhook.statusCode, 200)
   await new Promise((r) => setTimeout(r, 20))
   assert.equal(createdAgents.length, agentsBeforeV2 + 1, 'a v2 webhook event must reach an agent')
-  assert.equal(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, 'v2 webhook message')
+  assert.match(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, /^v2 webhook message\n\n\[Messaging host metadata\]\n\[message ref: msgref_[a-f0-9]{40}\]$/)
 
   // ── 飞书入站痕迹：每个丢弃分支都要在 recent 里留痕（kind=lark-drop）────
   // 只记原因与 message_type / chat_type / 文本长度，**绝不记消息原文**；
@@ -856,7 +856,10 @@ async function main() {
   await leaseH.close()
   assert.equal(createdAgents.length, agentsBeforePost + 1, 'a rich text post must reach an agent')
   const postBlocks = createdAgents[createdAgents.length - 1].agent.messages[0].content
-  assert.deepEqual(postBlocks.filter((b) => b.type === 'text').map((b) => b.text), ['post-title', 'line-1', 'link-label'], 'E：post 文本按原顺序保留（title/文本/链接）')
+  const postTextBlocks = postBlocks.filter((b) => b.type === 'text').map((b) => b.text)
+  assert.deepEqual(postTextBlocks.slice(0, -1), ['post-title', 'line-1', 'link-label'], 'E：post 原文本按原顺序保留（title/文本/链接）')
+  assert.match(postTextBlocks.at(-1), /^\n\n\[Messaging host metadata\]\n\[message ref: msgref_[a-f0-9]{40}\]$/, 'M2：仅追加一段宿主引用元数据')
+  assert.equal(postBlocks.at(-1).type, 'text')
   assert.equal(postBlocks.filter((b) => b.type === 'image').length, 1, 'E：post 图片进统一管线 typed block（不静默丢图）')
   // E：纯文本 post（无图）→ 原文本路径（无视觉/附件服务也入队；larkPostText 保真）
   const agentsBeforePostTxt = createdAgents.length
@@ -1065,7 +1068,7 @@ async function main() {
   await larkEventHandler(sdkDelivered)
   await new Promise((r) => setTimeout(r, 20))
   assert.equal(createdAgents.length, agentsBeforeLc + 1, 'a pushed long-connection event should reach an agent')
-  assert.equal(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, 'hi over ws')
+  assert.match(createdAgents[createdAgents.length - 1].agent.messages[0].content[0].text, /^hi over ws\n\n\[Messaging host metadata\]\n\[message ref: msgref_[a-f0-9]{40}\]$/)
   // 长连接送达的事件同样刷新 lastEventAt（connectedAt 不受影响）。
   const larkTraceStatus = await channelStatus('lark')
   assert.equal(typeof larkTraceStatus.detail.lastEventAt, 'number', 'lastEventAt must record the delivered event')
@@ -1126,12 +1129,14 @@ async function main() {
   assert.equal(noted.outcome, 'noted')
   assert.equal(typeof (await channelStatus('lark')).detail.lastEventAt, 'number', 'any event refreshes lastEventAt')
 
-  // ── 消息已读事件：同一张表的空处理器 + 首次 noted；execute 不重复进 recent ──
+  // B：已读事件独立持久接管，仍只首次 noted；execute 不重复进 recent。
   const messageRead = larkHandlers['im.message.message_read_v1']
   assert.equal(typeof messageRead, 'function', 'the message-read event must have a registered handler')
   sdkLogger.debug(['execute im.message.message_read_v1 handle']) // 分类器按表去重：不进 recent
-  await messageRead({})
-  await messageRead({})
+  await assert.rejects(messageRead({}), /interaction event unavailable/, 'malformed read events must not become accepted state')
+  const readEvent = { event_id: 'synthetic-read-event', reader: { reader_id: { open_id: 'synthetic-reader' }, read_time: String(Date.now()) }, message_id_list: ['unregistered-message'] }
+  await messageRead(readEvent)
+  await messageRead(readEvent)
   await tick()
   const afterRead = await larkSdkEvents()
   assert.equal(afterRead.length, 4, 'the execute row is skipped and the read event is noted exactly once')
@@ -1182,7 +1187,7 @@ async function main() {
   assert.equal(resumedAgents.length, resumedBefore + 1, 'the persisted session must be resumed instead of created')
   const resumed = resumedAgents[resumedAgents.length - 1]
   assert.equal(resumed.options.resumeSessionId, wsSessionId)
-  assert.equal(resumed.agent.messages.map((m) => m.content[0].text).includes('second over ws'), true, 'the resumed agent received the message')
+  assert.equal(resumed.agent.messages.some((m) => /^second over ws\n\n\[Messaging host metadata\]\n\[message ref: msgref_[a-f0-9]{40}\]$/.test(m.content[0].text)), true, 'the resumed agent received the message')
   const afterResume = await invoke('GET', '/__dsh-messaging/status')
   assert.equal(
     afterResume.json.errors.some((entry) => String(entry.message).includes('already exists')),

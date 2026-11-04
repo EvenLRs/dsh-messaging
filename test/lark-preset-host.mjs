@@ -1,4 +1,4 @@
-// Real 0.2.1-rc.3 Loader/PresetRegistry/Agent/Tools/FS/bash/subprocess.
+// Real extracted host Loader/PresetRegistry/Agent/Tools/FS/bash/subprocess.
 // Feishu and model responses are fake; all paths and images are temporary.
 // Native bash actually generates a PNG. PTC below checks presentation/SDK only.
 'use strict'
@@ -45,6 +45,11 @@ async function main() {
 
   const routes = new Map()
   const wire = { uploads: 0, sends: 0, images: 0, notices: 0 }
+  // Recovery must prove the exact requested message AND chat, as production
+  // GET does. Missing identity fields in this old fixture made cold recovery
+  // fail closed; never weaken that product check to make a host probe pass.
+  const syntheticMessages = new Map()
+  const recoveredItem = url => syntheticMessages.get(decodeURIComponent(new URL(url).pathname.split('/').at(-1)))
   const classify = (raw) => {
     const body = typeof raw === 'string' ? JSON.parse(raw) : raw
     const content = JSON.parse(body.content)
@@ -61,7 +66,7 @@ async function main() {
     wire.lastUrl = url
     if (url.includes('/auth/v3/tenant_access_token')) return { data: { code: 0, tenant_access_token: 't-1', expire: 7200 }, status: 200, headers: {}, config }
     if (url.includes('/im/v1/images')) { wire.uploads += 1; return { data: { code: 0, data: { image_key: 'img_v3_real' } }, status: 200, headers: {}, config } }
-    if (url.includes('/im/v1/messages') && String(config.method).toLowerCase()==='get') return {data:{code:0,data:{items:[{msg_type:'text',body:{content:JSON.stringify({text:'synthetic recovered'})}}]}},status:200,headers:{},config}
+    if (url.includes('/im/v1/messages') && String(config.method).toLowerCase()==='get') { const item=recoveredItem(url); return {data:{code:0,data:{items:item?[item]:[]}},status:200,headers:{},config} }
     if (url.includes('/im/v1/messages')) { wire.sends += 1; classify(config.data); return { data: { code: 0, data: { message_id: 'om_real_1' } }, status: 200, headers: {}, config } }
     const err = new Error('unexpected feishu url ' + url); throw err
   }
@@ -73,7 +78,11 @@ async function main() {
       let body = '{"code":0,"data":{"message_id":"om_real_1"}}'
       if (stdin.includes('/open-apis/auth/')) body = '{"code":0,"tenant_access_token":"t-1","expire":7200}'
       else if (stdin.includes('/im/v1/images')) { wire.uploads += 1; body = '{"code":0,"data":{"image_key":"img_v3_real"}}' }
-      else if (stdin.includes('/im/v1/messages/om_')) body = JSON.stringify({code:0,data:{items:[{msg_type:'text',body:{content:JSON.stringify({text:'synthetic recovered'})}}]}})
+      else if (stdin.includes('/im/v1/messages/om_')) {
+        const url=stdin.match(/url = "([^"\n]+)"/)?.[1]
+        const item=url&&recoveredItem(url)
+        body=JSON.stringify({code:0,data:{items:item?[item]:[]}})
+      }
       else if (stdin.includes('/im/v1/messages')) {
         wire.sends += 1
         const line = stdin.split('\n').find(line => line.startsWith('data-binary = '))
@@ -169,6 +178,7 @@ async function main() {
   const handler = routes.get('/messaging/lark/events')
   assert.ok(handler, '真实插件注册 webhook 路由')
   const postInbound = async (messageId, chatId, type = 'text') => {
+    syntheticMessages.set(messageId,{message_id:messageId,chat_id:chatId,msg_type:type,body:{content:JSON.stringify(type==='image'?{image_key:'img_fixture_text_only'}:{text:'synthetic recovered'})}})
     const body = JSON.stringify({
       schema: '2.0',
       header: { event_type: 'im.message.receive_v1', token: 'tok_rt', event_id: 'ev_' + messageId },
@@ -275,6 +285,7 @@ async function main() {
   // Cold claimed row resumes from durable routing with no new user event.
   const {openLarkDedupStore,larkDedupKey}=await import('../lib/lark-dedup.js')
   const lease=await openLarkDedupStore(path.join(home,'lark-dedup'))
+  syntheticMessages.set('om_preset_cold',{message_id:'om_preset_cold',chat_id:'oc_rt1',msg_type:'text',body:{content:JSON.stringify({text:'synthetic recovered'})}})
   const cold=await lease.claim({appId:'cli_realtool',messageId:'om_preset_cold',chatId:'oc_rt1',chatType:'p2p',sessionId:sid,sessionExisted:true})
   lease.release(cold.record.key)
   await pluginFiber.dispose();await tick()

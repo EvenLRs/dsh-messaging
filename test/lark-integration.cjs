@@ -163,15 +163,15 @@ function routeResponseBody(parsed) {
     return JSON.stringify({ code: 0, msg: 'ok', data: { card_id: 'ck_' + (++wireIdSeq) } })
   }
   if (process.env.DSH_AUDIT_REGRESSION_ONLY === '1' && parsed.method === 'GET' && /\/im\/v1\/messages\/om_(bind_fault|bind_webhook|generation_resume|r1_)/.test(url)) {
-    return JSON.stringify({ code: 0, data: { items: [{ msg_type: 'text', body: { content: JSON.stringify({ text: 'synthetic recovered body' }) } }] } })
+    return JSON.stringify({ code: 0, data: { items: [{ message_id: url.split('/messages/')[1], chat_id: 'oc_' + url.split('/messages/')[1], create_time: String(Date.now()), msg_type: 'text', body: { content: JSON.stringify({ text: 'synthetic recovered body' }) } }] } })
   }
   if (parsed.method === 'GET' && url.includes('/im/v1/messages/om_rec_b')) {
     // C：恢复取正文（message GET 只读）——恢复调度用真实 wire 路径验证。
-    return JSON.stringify({ code: 0, msg: 'ok', data: { items: [{ message_id: 'om_rec_b', msg_type: 'text', body: { content: JSON.stringify({ text: '恢复正文' }) } }] } })
+    return JSON.stringify({ code: 0, msg: 'ok', data: { items: [{ message_id: 'om_rec_b', chat_id: 'oc_recover', create_time: String(Date.now()), msg_type: 'text', body: { content: JSON.stringify({ text: '恢复正文' }) } }] } })
   }
   if (parsed.method === 'GET' && url.includes('/im/v1/messages/om_rec_g')) {
     // E：恢复 image（GET 重建 parts → 统一内容管线）。
-    return JSON.stringify({ code: 0, msg: 'ok', data: { items: [{ message_id: 'om_rec_g', msg_type: 'image', body: { content: JSON.stringify({ image_key: 'img_v3_k9' }) } }] } })
+    return JSON.stringify({ code: 0, msg: 'ok', data: { items: [{ message_id: 'om_rec_g', chat_id: 'oc_img1', create_time: String(Date.now()), msg_type: 'image', body: { content: JSON.stringify({ image_key: 'img_v3_k9' }) } }] } })
   }
   if (parsed.method === 'POST' && url.includes('/im/v1/messages')) {
     return JSON.stringify({ code: 0, msg: 'ok', data: { message_id: 'om_' + (++wireIdSeq) } })
