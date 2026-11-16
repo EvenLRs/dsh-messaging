@@ -1,3 +1,4 @@
+import hostExecutors from './host-executors.cjs'
 // 真实宿主准入探针（手动运行，不进 npm test 链——package.json 未改）。
 //
 // 依赖一次性解包的已装宿主（默认 /tmp/dsh-hostx，可用 DSH_HOSTX_ROOT 覆盖）。
@@ -59,7 +60,7 @@ const check = (name, ok, detail) => {
 async function mount(root, registerDefinition) {
   const ctx = new Context()
   await ctx.plugin(llm.default); await ctx.plugin(sess.default); await ctx.plugin(Proj)
-  await ctx.plugin(SystemPrompt); await ctx.plugin(ToolRuntime); await ctx.plugin(AgentRegistry)
+  await ctx.plugin(SystemPrompt); await ctx.plugin(ToolRuntime); await hostExecutors.native(ctx); await ctx.plugin(AgentRegistry)
   await ctx.plugin(Jsonl, { root }); await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], new Mock())
   if (registerDefinition) ctx.sessionProjections.register(registerDefinition)
@@ -129,7 +130,7 @@ const def = admission.createLarkAdmissionDefinition()
       'class Mock extends llm.LlmAdapter { constructor(){ super(); this.n=0 } resolveModel(p,m){ return Promise.resolve({provider:p,id:m,name:m}) } async *stream(){ this.n++; const t="ok"+this.n; yield {type:"block-start",index:0,blockType:"text"}; yield {type:"text-delta",index:0,text:t}; yield {type:"block-end",index:0,block:{type:"text",text:t}}; yield {type:"usage",usage:{inputTokens:1,outputTokens:1}}; yield {type:"finish",reason:{kind:"stop"}} } }',
       'const ctx = new Context()',
       'await ctx.plugin(llm.default); await ctx.plugin(sess.default); await ctx.plugin(Proj)',
-      'await ctx.plugin(SystemPrompt); await ctx.plugin(ToolRuntime); await ctx.plugin(AgentRegistry)',
+      'await ctx.plugin(SystemPrompt); await ctx.plugin(ToolRuntime); await (await import('+JSON.stringify(new URL('./host-executors.cjs', import.meta.url).href)+')).default.native(ctx); await ctx.plugin(AgentRegistry)',
       'await ctx.plugin(Jsonl, { root }); await ctx.plugin(AgentLoop, { agents: [] })',
       'ctx.llm.registerAdapter(["mock"], new Mock())',
       'ctx.sessionProjections.register(admission.createLarkAdmissionDefinition())',

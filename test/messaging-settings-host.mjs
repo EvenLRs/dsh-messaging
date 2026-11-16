@@ -16,12 +16,71 @@ const Cordis = await import(pathToFileURL(path.join(modules, 'cordis/lib/index.j
 const frontend = path.join(modules, 'dsh-web-frontend/dist/assets')
 const built = fs.readdirSync(frontend).filter(n => /^index-.*\.js$/.test(n)).map(n => fs.readFileSync(path.join(frontend, n), 'utf8')).find(s => s.includes('SlotCore:'))
 assert.ok(built, 'rc.3 bundled SlotCore must exist')
-const slotName = built.match(/SlotCore:([A-Za-z_$][\w$]*)/)[1]
-// Keep the host's entire small slot module (helpers + classes), not a mirrored implementation.
-const actualStart = built.indexOf('function kI(') // rc.3 frozen asset; fail explicitly on incompatible host
-assert.ok(actualStart >= 0 && slotName === 'SI', 'host SlotCore extraction contract changed')
-const sourceEnd = built.indexOf(';const jI=', actualStart)
-const slotExports = vm.runInNewContext(built.slice(actualStart, sourceEnd + 1) + ';({ SlotCore: SI, resolveSlotLabel: $I })', { queueMicrotask })
+// Resolve the host's public virtual-module exports through its AST. No generated
+// symbol name or compressed declaration boundary is part of this fixture.
+const { parse } = await import(pathToFileURL(path.join(host, 'dsh/node_modules/acorn/dist/acorn.mjs')))
+const ast = parse(built, { ecmaVersion: 'latest', sourceType: 'module' })
+const declarations = new Map()
+for (const statement of ast.body) {
+  if (statement.type === 'FunctionDeclaration' || statement.type === 'ClassDeclaration') declarations.set(statement.id.name, statement)
+  if (statement.type === 'VariableDeclaration') for (const d of statement.declarations) {
+    if (d.id.type === 'Identifier') declarations.set(d.id.name, { ...statement, declarations: [d], start: d.start, end: d.end, variableKind: statement.kind })
+  }
+}
+function visit(node, callback) {
+  if (!node || typeof node !== 'object') return
+  if (node.type) callback(node)
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'start' || key === 'end') continue
+    if (Array.isArray(value)) value.forEach(child => visit(child, callback))
+    else if (value && typeof value === 'object') visit(value, callback)
+  }
+}
+let publicExports
+visit(ast, node => {
+  if (node.type === 'ObjectExpression' && node.properties.some(p => p.key?.name === 'SlotCore') && node.properties.some(p => p.key?.name === 'resolveSlotLabel')) publicExports = node
+})
+assert.ok(publicExports, 'host public slots module exports must exist')
+const exportNames = ['SlotCore', 'resolveSlotLabel']
+const bindings = Object.fromEntries(exportNames.map(name => {
+  const property = publicExports.properties.find(p => p.key?.name === name)
+  assert.equal(property.value.type, 'Identifier', 'public export must resolve to host implementation')
+  return [name, property.value.name]
+}))
+const selected = new Set()
+function include(name) {
+  if (selected.has(name) || !declarations.has(name)) return
+  selected.add(name)
+  const declaration = declarations.get(name)
+  const local = new Set()
+  const bind = node => {
+    if (!node) return
+    if (node.type === 'Identifier') local.add(node.name)
+    else if (node.type === 'RestElement') bind(node.argument)
+    else if (node.type === 'AssignmentPattern') bind(node.left)
+    else if (node.type === 'ArrayPattern') node.elements.forEach(bind)
+    else if (node.type === 'ObjectPattern') node.properties.forEach(p => bind(p.value || p.argument))
+  }
+  visit(declaration, node => {
+    if (node.type === 'VariableDeclarator') bind(node.id)
+    if (node.type.includes('Function')) { node.params?.forEach(bind); bind(node.id) }
+    if (node.type === 'CatchClause') bind(node.param)
+  })
+  function references(node, parent, key) {
+    if (!node || typeof node !== 'object') return
+    if (node.type === 'Identifier' && !local.has(node.name) &&
+      !(parent?.type === 'MemberExpression' && key === 'property' && !parent.computed) &&
+      !((parent?.type === 'Property' || parent?.type === 'MethodDefinition') && key === 'key' && !parent.computed)) include(node.name)
+    for (const [k,v] of Object.entries(node)) {
+      if (Array.isArray(v)) v.forEach(child => references(child,node,k))
+      else if (v && typeof v === 'object') references(v,node,k)
+    }
+  }
+  references(declaration)
+}
+Object.values(bindings).forEach(include)
+const sources = [...selected].map(name => declarations.get(name)).sort((a,b) => a.start-b.start).map(node => (node.variableKind ? node.variableKind + ' ' : '') + built.slice(node.start,node.end) + ';')
+const slotExports = vm.runInNewContext(sources.join('\n') + ';({' + Object.entries(bindings).map(([key,value]) => key + ':' + value).join(',') + '})', { queueMicrotask })
 const core = new slotExports.SlotCore()
 const slots = {
   entries: name => core.entries(name), getVersion: name => core.getVersion(name),
@@ -123,7 +182,7 @@ const { default: Timer } = await import(pathToFileURL(path.join(modules, 'cordis
 root.plugin(Timer)
 const settings = loadClient(fs.readFileSync(file('dsh-client-ui-settings'), 'utf8'), name => {
   if (name === '@deepseek-ai/cordis') return Cordis
-  if (name === '@deepseek-ai/dsh-client-store') return { createSnapshotStore: snapshotStore }
+  if (name === '@deepseek-ai/dsh-client-store') return { createSnapshotStore: snapshotStore, defineStore: spec => ({ create: () => ({ ...snapshotStore(spec.init()), actions: {} }) }) }
   throw new Error('Unexpected real UI settings dependency: ' + name)
 })
 let settingsFiber = root.plugin(settings); await tick()
@@ -143,18 +202,22 @@ const fetch = async (url, init = {}) => {
   return { ok: true, text: async () => JSON.stringify(data) }
 }
 // Exercise the real rc.3 SettingsForm owner as well as the slot/configForms.
-const settingsFormStart = built.indexOf('function dR(')
-const settingsFormEnd = built.indexOf('function fR(', settingsFormStart)
-assert.ok(settingsFormStart >= 0 && settingsFormEnd > settingsFormStart, 'real SettingsForm extraction contract')
-const names = built.match(/Zi=\{([^}]+)\}/)[1].split(',')
-const settingsClasses = Object.fromEntries(names.map(pair => {
-  const [key, variable] = pair.split(':')
-  const match = built.match(new RegExp('(?:const |,)' + variable + '="([^"]+)"'))
-  assert.ok(match, 'real SettingsForm class mapping: ' + key)
-  return [key, match[1]]
-}))
-const formJsx = (type, props) => ({ type, props })
-const RealSettingsForm = vm.runInNewContext(built.slice(settingsFormStart, settingsFormEnd) + ';dR', { C: React, d: { jsx: formJsx, jsxs: formJsx }, Zi: settingsClasses })
+let formBinding
+visit(ast, node => {
+  if (node.type === 'Property' && node.key?.name === 'SettingsForm' && node.value.type === 'Identifier') formBinding = node.value.name
+})
+assert.ok(formBinding && declarations.has(formBinding), 'host public SettingsForm implementation exists')
+const formAdapters = {}
+visit(declarations.get(formBinding), node => {
+  if (node.type !== 'MemberExpression' || node.object.type !== 'Identifier') return
+  if (['useState','useEffect','useMemo','useRef','createElement'].includes(node.property?.name)) formAdapters[node.object.name] = React
+  if (['jsx','jsxs'].includes(node.property?.name)) formAdapters[node.object.name] = { jsx: (type,props) => ({type,props}), jsxs: (type,props) => ({type,props}) }
+})
+selected.clear()
+for (const name of Object.keys(formAdapters)) selected.add(name)
+include(formBinding)
+const formSources = [...selected].filter(name => !Object.hasOwn(formAdapters,name)).map(name => declarations.get(name)).sort((a,b) => a.start-b.start).map(node => (node.variableKind ? node.variableKind + ' ' : '') + built.slice(node.start,node.end) + ';')
+const RealSettingsForm = vm.runInNewContext(formSources.join('\n') + ';' + formBinding, formAdapters)
 const client = loadClient(fs.readFileSync(process.env.MESSAGING_PREVIEW_CLIENT || new URL('../lib/client.js', import.meta.url), 'utf8'), name => {
   if (name === 'react') return React
   if (name === '@deepseek-ai/dsh-client-ui-primitives') return { SettingsForm: RealSettingsForm }
@@ -210,15 +273,26 @@ const ownerRequire = name => {
   if (name === 'react-dom') return { createPortal: node => node }
   if (name === '@deepseek-ai/dsh-client-ui-primitives') return primitives
   if (name === '@deepseek-ai/dsh-client-ui-slots') return slotExports
-  if (name === '@deepseek-ai/dsh-client-store') return { createSnapshotStore: snapshotStore }
+  if (name === '@deepseek-ai/dsh-client-store') return { createSnapshotStore: snapshotStore, defineStore: spec => ({ create: () => ({ ...snapshotStore(spec.init()), actions: {} }) }) }
   throw new Error('unexpected owner import ' + name)
 }
-const generalOwner = loadClient(generalSource.replace('exports.apply = apply;', 'exports.__owner = SettingsPanel; exports.apply = apply;'), ownerRequire)
-const managerOwner = loadClient(managerSource.replace('exports.apply = apply;', 'exports.__owner = RowDetail; exports.apply = apply;'), ownerRequire)
-const mapStart = generalSource.indexOf('const version = ctx.slots.getVersion("settings.section");')
-const mapEnd = generalSource.indexOf('return rows;', mapStart) + 'return rows;'.length
-assert.ok(mapStart > 0 && mapEnd > mapStart)
-const navRows = vm.runInNewContext('(function(){let rowsVersion=-1,rowsRevision=-1,rows=[];return () => {' + generalSource.slice(mapStart, mapEnd) + '};})()', { ctx: { slots, locale: { getSnapshot: () => ({ revision: 1 }) } }, _deepseek_ai_dsh_client_ui_slots: slotExports })
+const generalOwner = loadClient(generalSource.replace(/exports\.apply\s*=\s*apply;/, 'exports.__owner = SettingsPanel; exports.apply = apply;'), ownerRequire)
+const managerOwner = loadClient(managerSource.replace(/exports\.apply\s*=\s*apply;/, 'exports.__owner = RowDetail; exports.apply = apply;'), ownerRequire)
+// Run the real owner apply and read its public injected sections store.
+let shellRegistration
+const idleStore = snapshotStore({})
+generalOwner.apply({
+  slots: { ...slots, inject(name, register) { if (name === 'sidebar.settings') return register(); return () => {} }, register(options) { shellRegistration = options; return () => {} } },
+  effect(fn) { return fn() },
+  locale: { register() { return () => {} }, bind: () => key => key, getSnapshot: () => ({revision:1}), subscribe: () => () => {} },
+  get: name => name === 'connection' ? { state: idleStore, reconnect() {} } : undefined,
+  remote: { $host: { isLoopback: false } },
+  remoteAccess: { whenAccess(_name, callback) { return callback() } },
+  shortcuts: { catalog: idleStore, register() { return () => {} } },
+  configForms: { developerTools: { enabled: idleStore } },
+})
+assert.equal(shellRegistration.name, 'sidebar.settings', 'real owner registers public settings shell')
+const navRows = () => shellRegistration.inject().hooks.sections.getSnapshot()
 assert.equal(navRows()[0].label, 'Messaging', 'actual owner entries mapping produces navigation label')
 assert.equal(navRows()[0].id, 'messaging')
 const consumed = []

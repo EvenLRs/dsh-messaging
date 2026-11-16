@@ -1,3 +1,4 @@
+import hostExecutors from './host-executors.cjs'
 // Independent D: fake provider/network; real Cordis, Agent loop, Tools, ApprovalService.
 import { spawnSync } from 'node:child_process'
 import { createHash, createCipheriv, randomBytes } from 'node:crypto'
@@ -81,7 +82,7 @@ try {
     }
   }
   ctx.llm.registerAdapter(['mock'], new Mock())
-  await ctx.plugin(Tools.default)
+  await ctx.plugin(Tools.default); await hostExecutors.native(ctx)
   await ctx.plugin(Agent.default)
   await ctx.plugin((await imp('dsh-session-persistence-jsonl')), { root: path.join(home, 'sessions') })
   await ctx.plugin((await imp('dsh-agent-loop')).default, { agents: [] })
@@ -115,7 +116,7 @@ try {
           .filter(e => e?.type === 'agent/inbox/spliced').flatMap(e => e.data.inserted || []).find(m => m.id === row.userMessageId)
         const ref = JSON.stringify(admitted || '').match(/\[message ref: (msgref_[a-f0-9]+)\]/)?.[1]
         if (ref) refs.set(id, ref)
-        const result = (ref || alreadyAdmitted) && await ctx.tools.execute({ agent: a, callId: 'wait-' + id, name: 'messaging_context', arguments: ref ? { target: ref } : {}, signal: new AbortController().signal })
+        const result = (ref || alreadyAdmitted) && await hostExecutors.execute(ctx.tools, { agent: a, callId: 'wait-' + id, name: 'messaging_context', arguments: ref ? { target: ref } : {}, signal: new AbortController().signal })
         if (result?.value?.ok) return a
       }
       await tick()
@@ -125,7 +126,7 @@ try {
   const wait = async (fn, label) => {const deadline=Date.now()+8000;while(!fn()){assert.ok(Date.now()<deadline,label);await tick()}}
   const events=a=>Array.from({length:a.session.seq},(_,i)=>a.session.eventAt(i))
   const inputs=a=>events(a).filter(e=>e?.type==='agent/inbox/spliced').flatMap(e=>e.data.inserted||[]).filter(m=>JSON.stringify(m).includes('Messaging card input'))
-  const call=(a,name,args={})=>ctx.tools.execute({agent:a,callId:'setup-'+name, name,arguments:args,signal:new AbortController().signal})
+  const call=(a,name,args={})=>hostExecutors.execute(ctx.tools, {agent:a,callId:'setup-'+name, name,arguments:args,signal:new AbortController().signal})
   const bound=await post('D-incoming','D-chat')
   await wait(()=>bound.status==='idle','initial turn completes')
   const probeName='synthetic_guarded'
@@ -250,7 +251,7 @@ try {
   }
   ctx.provide('ptcRuntime',{language:'typescript',programFormat:'function-body'})
   for(const a of [ordinary,child]){
-    const off=a.ctx.get('tools').presentAs('ptc')
+    const off=await hostExecutors.ptc(a.ctx)
     const assembled=await ctx.systemPrompt.assemble({scope:a})
     assert.deepEqual(assembled.tools.map(t=>t.name),['run_code'])
     for(const name of names)assert.equal(JSON.stringify(assembled).includes(name),false)

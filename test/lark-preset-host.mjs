@@ -1,3 +1,4 @@
+import hostExecutors from './host-executors.cjs'
 // Real extracted host Loader/PresetRegistry/Agent/Tools/FS/bash/subprocess.
 // Feishu and model responses are fake; all paths and images are temporary.
 // Native bash actually generates a PNG. PTC below checks presentation/SDK only.
@@ -116,7 +117,7 @@ async function main() {
   await ctx.plugin((await imp('dsh-working-directory')).default,{defaultDirectory:ws})
   await ctx.plugin((await imp('dsh-shell-env')).ShellEnvRegistry,{dshHome:home})
 
-  let toolsFiber=await ctx.plugin(ToolRuntime)
+  let toolsFiber=await ctx.plugin(ToolRuntime); await hostExecutors.native(ctx)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(Jsonl, { root: path.join(home, 'sessions') })
   await ctx.plugin(AgentLoop, { agents: [] })
@@ -221,7 +222,7 @@ async function main() {
   assert.equal(definition(bound),def)
   assert.equal(ctx.tools.get('write'),undefined,'no global fs tool fallback')
   assert.equal(ctx.tools.get('bash'),undefined,'no global shell tool fallback')
-  const call=(agent,name,args,id)=>ctx.tools.execute({callId:id,name,arguments:args,agent,signal:new AbortController().signal})
+  const call=(agent,name,args,id)=>hostExecutors.execute(ctx.tools, {callId:id,name,arguments:args,agent,signal:new AbortController().signal})
   // Write a generator through the real file tool, then run it through the real
   // bash tool/local executor/subprocess chain in the ordinary scoped preset.
   const program="require('node:fs').writeFileSync('generated.png',Buffer.from('"+PNG.toString('base64')+"','base64'))"
@@ -340,7 +341,7 @@ async function main() {
   // without mistaking this fake runtime metadata for a PTC execution test.
   ctx.provide('ptcRuntime',{language:'typescript',programFormat:'function-body'})
   const ptcMode=path.join(home,'ptc-mode.mjs')
-  fs.writeFileSync(ptcMode,"export const inject=['tools']; export function apply(ctx){ctx.tools.presentAs('ptc')}\n")
+  fs.writeFileSync(ptcMode,"import helpers from "+JSON.stringify(new URL('./host-executors.cjs',import.meta.url).href)+"; export const inject=['tools','systemPrompt','ptcRuntime']; export async function apply(ctx){await helpers.ptc(ctx)}\n")
   await ctx.agentPresets.register({id:'ptc-fixture',plugins:[
     {name:moduleUrl('dsh-tool-fs'),config:{readImage:false}},
     {name:pathToFileURL(ptcMode).href},

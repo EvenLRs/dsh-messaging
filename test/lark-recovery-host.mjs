@@ -1,3 +1,4 @@
+import hostExecutors from './host-executors.cjs'
 // test/lark-recovery-host.mjs —— 真实宿主恢复专项（编码验证，非独立审核）。
 //
 // 边界：只用一次性解包的已装宿主包（DSH_HOSTX_ROOT，默认 /tmp/dsh-hostx）+ 临时
@@ -177,7 +178,7 @@ async function makeEnv(name, opts = {}) {
   await ctx.plugin(Proj)
   await ctx.plugin(ProjCache, { writeEveryEvents: 50, writeIntervalMs: 3600000 })
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(ToolRuntime); await hostExecutors.native(ctx)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(Jsonl, { root: path.join(home, 'sessions') })
   await ctx.plugin(AgentLoop, { agents: [] })
@@ -575,7 +576,7 @@ async function scenario4c() {
     'const [home, ws] = process.argv.slice(2)',
     'const ctx = new Context()',
     'await ctx.plugin(llm.default); await ctx.plugin(sess.default); await ctx.plugin(Proj)',
-    'await ctx.plugin(SystemPrompt); await ctx.plugin(ToolRuntime); await ctx.plugin(AgentRegistry)',
+    'await ctx.plugin(SystemPrompt); await ctx.plugin(ToolRuntime); await (await import('+JSON.stringify(new URL('./host-executors.cjs', import.meta.url).href)+')).default.native(ctx); await ctx.plugin(AgentRegistry)',
     "await ctx.plugin(Jsonl, { root: home + '/sessions' }); await ctx.plugin(AgentLoop, { agents: [] })",
     "class Mock extends llm.LlmAdapter { resolveModel(p, m) { return Promise.resolve({ provider: p, id: m, name: m }) } async *stream() { yield { type: 'block-start', index: 0, blockType: 'text' }; yield { type: 'text-delta', index: 0, text: 'ok' }; yield { type: 'block-end', index: 0, block: { type: 'text', text: 'ok' } }; yield { type: 'finish', reason: { kind: 'stop' } } } }",
     "ctx.llm.registerAdapter(['mock'], new Mock())",

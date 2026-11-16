@@ -1,3 +1,4 @@
+import hostExecutors from './host-executors.cjs'
 import { spawnSync } from 'node:child_process'
 import { createHash, createCipheriv, randomBytes } from 'node:crypto'
 import protobuf from 'protobufjs'
@@ -100,7 +101,7 @@ try {
     }
   }
   ctx.llm.registerAdapter(['mock'], new Mock())
-  let toolsFiber = await ctx.plugin(Tools.default)
+  let toolsFiber = await ctx.plugin(Tools.default); await hostExecutors.native(ctx)
   await ctx.plugin(Agent.default)
   await ctx.plugin((await imp('dsh-session-persistence-jsonl')), { root: path.join(home, 'sessions') })
   await ctx.plugin((await imp('dsh-agent-loop')).default, { agents: [] })
@@ -125,7 +126,7 @@ try {
           .filter(e => e?.type === 'agent/inbox/spliced').flatMap(e => e.data.inserted || []).find(m => m.id === row.userMessageId)
         const ref = JSON.stringify(admitted || '').match(/\[message ref: (msgref_[a-f0-9]+)\]/)?.[1]
         if (ref) refs.set(id, ref)
-        const result = (ref || alreadyAdmitted) && await ctx.tools.execute({ agent: a, callId: 'wait-' + id, name: 'messaging_context', arguments: ref ? { target: ref } : {}, signal: new AbortController().signal })
+        const result = (ref || alreadyAdmitted) && await hostExecutors.execute(ctx.tools, { agent: a, callId: 'wait-' + id, name: 'messaging_context', arguments: ref ? { target: ref } : {}, signal: new AbortController().signal })
         if (result?.value?.ok) return a
       }
       await tick()
@@ -137,7 +138,7 @@ try {
   const foreground = await ctx.agents.create({ sessionId: sessionIdForKey('lark:synthetic-chat'), meta: { cwd: home }, agentOptions: { provider: 'mock', model: 'm' } })
   let bound = await post('incoming-one')
   assert.equal(bound, foreground.agent, 'busy foreground agent reused with same scoped tools')
-  const call = (a, name, args = {}, id = name) => ctx.tools.execute({ agent: a, callId: id, name, arguments: args, signal: new AbortController().signal })
+  const call = (a, name, args = {}, id = name) => hostExecutors.execute(ctx.tools, { agent: a, callId: id, name, arguments: args, signal: new AbortController().signal })
   for (const name of names) { assert.equal(ctx.tools.get(name), undefined); assert.equal(ctx.tools.get(name, ordinary), undefined); Tools.assertObjectJsonSchema(ctx.tools.get(name, bound).parameters) }
   const uiPost = async (route, body) => {
     const req = Readable.from([Buffer.from(JSON.stringify(body))]); req.method = 'POST'
@@ -163,7 +164,7 @@ try {
   for (const name of names) assert.equal(ctx.tools.get(name, child), undefined)
   ctx.provide('ptcRuntime', { language: 'typescript', programFormat: 'function-body' })
   const assemble = a => ctx.systemPrompt.assemble({ scope: a })
-  const ptc = [ordinary, bound, child].map(a => a.ctx.get('tools').presentAs('ptc'))
+  const ptc = await Promise.all([ordinary, bound, child].map(a => hostExecutors.ptc(a.ctx)))
   for (const a of [ordinary, bound, child]) {
     const view = await assemble(a); assert.deepEqual(view.tools.map(t => t.name), ['run_code'])
     for (const name of names) assert.equal(view.sections.find(s => s.name === 'tools:sdk').text.includes(name), a === bound)
@@ -300,7 +301,7 @@ try {
   releaseReply(); replyGate = null; onDispatch = null
   assert.equal((await oldPending).value.status, 'unknown', 'old in-flight call cannot publish success after service/agent retirement')
   for (const name of names) assert.equal(bound.ctx.get('tools')?.get(name, bound), undefined)
-  toolsFiber = await ctx.plugin(Tools.default); await tick()
+  toolsFiber = await ctx.plugin(Tools.default); await hostExecutors.native(ctx); await tick()
   assert.equal(ctx.agents.get(bound.session.id), undefined, 'real Host retires agents when Tools dependency is replaced')
   const retired = bound
   bound = await post('incoming-after-tools-replacement')

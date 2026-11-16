@@ -1,3 +1,4 @@
+import hostExecutors from './host-executors.cjs'
 // Current-host regression for session-only Lark tool visibility and wire schemas.
 // lark-image-tool-real.cjs —— 真实组合验收（Lead 终项）：真实 ToolRuntime + 真实
 // dsh-sandbox-policy + 真实 dsh-fs-local + 真实 dsh-attachment-local(sharp) + 真实插件
@@ -103,7 +104,7 @@ async function main() {
   await ctx.plugin(SandboxPolicy, { workspaceRoot: ws })
   await ctx.plugin(AttachmentLocal, { dshHome: home })
   await ctx.plugin(SystemPrompt)
-  let toolsFiber=await ctx.plugin(ToolRuntime)
+  let toolsFiber=await ctx.plugin(ToolRuntime); await hostExecutors.native(ctx)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(Jsonl, { root: path.join(home, 'sessions') })
   await ctx.plugin(AgentLoop, { agents: [] })
@@ -186,7 +187,7 @@ async function main() {
   assert.throws(()=>toolsPkg.assertObjectJsonSchema(legacy),e=>e.code==='UNSUPPORTED_SCHEMA','old raw shorthand is rejected')
   for(const args of [{file_path:'img.png'},{attachment_id:'synthetic'},{file_path:'img.png',caption:'synthetic'}])assert.deepEqual(toolsPkg.validateJsonSchemaValue(def.parameters,args),[])
   for(const args of [{file_path:1},{file_path:'img.png',url:'https://invalid.test'}])assert.ok(toolsPkg.validateJsonSchemaValue(def.parameters,args).length)
-  const call=(agent,args,id)=>ctx.tools.execute({callId:id,name:'lark_send_image',arguments:args,agent,signal:new AbortController().signal})
+  const call=(agent,args,id)=>hostExecutors.execute(ctx.tools, {callId:id,name:'lark_send_image',arguments:args,agent,signal:new AbortController().signal})
   for(const [args,reason] of [[{},'no_image_source'],[{file_path:'',attachment_id:''},'no_image_source'],[{file_path:'img.png',attachment_id:'synthetic'},'single_source_required'],[{attachment_id:'synthetic'},'no_attachment_authz'],[{file_path:'img.png',extra:'hidden'},'forbidden_parameter']]) {
     const result=await call(bound,args,'source-'+reason)
     assert.equal(result.value?.reason,reason)
@@ -205,7 +206,7 @@ async function main() {
   assert.equal(definition(child),undefined,'unbound child cannot inherit Lark tool')
   ctx.provide('ptcRuntime',{language:'typescript',programFormat:'function-body'})
   const ptc=[]
-  for(const agent of [ordinary,bound,child])ptc.push(agent.ctx.get('tools').presentAs('ptc'))
+  for(const agent of [ordinary,bound,child])ptc.push(await hostExecutors.ptc(agent.ctx))
   for(const agent of [ordinary,bound,child]){
     const a=await assemble(agent)
     assert.deepEqual(a.tools.map(t=>t.name),['run_code'])
@@ -271,7 +272,7 @@ async function main() {
   bound=ctx.agents.get(sid);assert.ok(definition(bound))
   assert.equal((await stale.execute({file_path:'img.png'},{agent:bound,callId:'old-plugin'})).reason,'not_bound_to_lark')
   await toolsFiber.dispose();await tick()
-  toolsFiber=await ctx.plugin(ToolRuntime);await tick()
+  toolsFiber=await ctx.plugin(ToolRuntime); await hostExecutors.native(ctx);await tick()
   await postInbound('om_bind_5','oc_rt1')
   bound=ctx.agents.get(sid)
   assert.equal(ctx.tools.schemas(bound).filter(t=>t.name==='lark_send_image').length,1)

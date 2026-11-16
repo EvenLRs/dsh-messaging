@@ -1,3 +1,4 @@
+import hostExecutors from './host-executors.cjs'
 // lark-image-tool-real.cjs —— 真实组合验收（Lead 终项）：真实 ToolRuntime + 真实
 // dsh-sandbox-policy + 真实 dsh-fs-local + 真实 dsh-attachment-local(sharp) + 真实插件
 // 注册的 lark_send_image；仅 Feishu 网络（curl 壳）与 LLM adapter 为 fake。
@@ -101,7 +102,7 @@ async function main() {
   await ctx.plugin(SandboxPolicy, { workspaceRoot: ws })
   await ctx.plugin(AttachmentLocal, { dshHome: home })
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(ToolRuntime); await hostExecutors.native(ctx)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(Jsonl, { root: path.join(home, 'sessions') })
   await ctx.plugin(AgentLoop, { agents: [] })
@@ -159,12 +160,12 @@ async function main() {
   assert.equal(ctx.tools.get('lark_send_image'), undefined, 'no global tool publication')
   assert.ok(ctx.tools.get('lark_send_image', agent1x), 'bound agent scope owns tool')
 
-  const exec = (agent, extra = {}) => ctx.tools.execute({ callId: 'ct-' + crypto.randomBytes(4).toString('hex'), name: 'lark_send_image', arguments: extra.args || { file_path: 'img.png' }, agent, signal: extra.signal || new AbortController().signal })
+  const exec = (agent, extra = {}) => hostExecutors.execute(ctx.tools, { callId: 'ct-' + crypto.randomBytes(4).toString('hex'), name: 'lark_send_image', arguments: extra.args || { file_path: 'img.png' }, agent, signal: extra.signal || new AbortController().signal })
 
   // 1) exec 缺失（无 agent）→ 拒绝且零读取零上传
   {
     const beforeR = counts.readBytes; const beforeU = wire.uploads; const beforeS = wire.sends
-    const res = await ctx.tools.execute({ callId: 'noagent', name: 'lark_send_image', arguments: { file_path: 'img.png' }, signal: new AbortController().signal })
+    const res = await hostExecutors.execute(ctx.tools, { callId: 'noagent', name: 'lark_send_image', arguments: { file_path: 'img.png' }, signal: new AbortController().signal })
     assert.notEqual(res.value && res.value.ok, true, 'exec 缺失不成功')
     assert.equal(counts.readBytes, beforeR, 'exec 缺失零读取')
     assert.equal(wire.uploads + wire.sends, beforeU + beforeS, 'exec 缺失零上传零发送')

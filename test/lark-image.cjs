@@ -775,6 +775,7 @@ async function main() {
     const hostCtx = new Context()
     await hostCtx.plugin(SystemPrompt)
     await hostCtx.plugin(toolsMod.default)
+    await require('./host-executors.cjs').native(hostCtx)
     const t2 = makeRealTransport((config) => (config.url.includes('tenant_access_token')
       ? TOKEN_OK(config)
       : { data: { code: 0, data: { image_key: 'img_v3_up', message_id: 'om_t' } }, status: 200, headers: {}, config }))
@@ -804,7 +805,7 @@ async function main() {
     hostCtx.tools.register(toolFull)
     const agent = { session: { id: 'sess-a', header: { cwd: '/ws' } } }
     const run = async (callId, args) => {
-      const r = await hostCtx.tools.execute({ callId, name: 'lark_send_image', arguments: args, agent, signal: new AbortController().signal })
+      const r = await require('./host-executors.cjs').execute(hostCtx.tools, { callId, name: 'lark_send_image', arguments: args, agent, signal: new AbortController().signal })
       // 真实 ToolRuntime 已对 value 做 schema 校验（违规会抛 INVALID_TOOL_OUTPUT）；双重断言。
       assert.deepEqual(validateJsonSchemaValue(toolFull.output.schema, r.value, ''), [], '真实 schema 校验通过: ' + JSON.stringify(r.value).slice(0, 120))
       assert.ok(Array.isArray(r.content), '真实执行 content 为 ContentBlock[]（非字符串）')
@@ -837,7 +838,7 @@ async function main() {
       throw Object.assign(new Error('reset'), { code: 'ECONNRESET' }) // 消息发送无响应（已派发后断开）
     })
     activeClient = nrT.client
-    const unk = await hostCtx.tools.execute({ callId: 'call-b8', name: 'lark_send_image', arguments: { file_path: 'img.png' }, agent, signal: new AbortController().signal })
+    const unk = await require('./host-executors.cjs').execute(hostCtx.tools, { callId: 'call-b8', name: 'lark_send_image', arguments: { file_path: 'img.png' }, agent, signal: new AbortController().signal })
     activeClient = t2.client
     assert.equal(unk.value.ok, false)
     assert.equal(unk.value.unknown, true, '真实执行 unknown 分支')
@@ -985,6 +986,7 @@ async function main() {
     const hc = new Context()
     await hc.plugin(SystemPrompt3)
     await hc.plugin(toolsMod3.default)
+    await require('./host-executors.cjs').native(hc)
     const evilHost = createLarkImageHost({
       makeClient: () => rc.client,
       receipts: r28lease.sendReceipts,
@@ -999,7 +1001,7 @@ async function main() {
       timeoutMs: 3000,
     })
     hc.tools.register(evilHost.makeSendImageTool())
-    const evil = await hc.tools.execute({ callId: 'call-evil', name: 'lark_send_image', arguments: { file_path: 'x.png' }, agent: agentR, signal: new AbortController().signal })
+    const evil = await require('./host-executors.cjs').execute(hc.tools, { callId: 'call-evil', name: 'lark_send_image', arguments: { file_path: 'x.png' }, agent: agentR, signal: new AbortController().signal })
     const evilJson = JSON.stringify(evil.value) + JSON.stringify(evil.content)
     assert.ok(!evilJson.includes('/Users/secret'), 'R3 恶意 code 不透传（结构化+render）')
     assert.equal(evil.value.errorCode, 'other', 'R3 非白名单 → other, got ' + evil.value.errorCode)

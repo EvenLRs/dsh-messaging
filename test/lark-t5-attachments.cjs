@@ -55,7 +55,11 @@ async function main() {
     '伪 PNG 被真解码器拒绝')
 
   // 3) 宿主体积限额（maxImageBytes 由 store 权威执行）
-  const overLimit = Buffer.concat([PNG, Buffer.alloc(22 * 1024 * 1024)])
+  const maxBytes = store.imageLimits.maxImageBytes
+  assert.ok(Number.isSafeInteger(maxBytes) && maxBytes > PNG.length)
+  // Exercise the actual host admission boundary, independently of Lark's 20MiB download cap.
+  await store.validateImage({ data: Buffer.concat([PNG, Buffer.alloc(maxBytes - PNG.length)]), mediaType: 'image/png' })
+  const overLimit = Buffer.concat([PNG, Buffer.alloc(maxBytes + 1 - PNG.length)])
   await assert.rejects(
     () => store.validateImage({ data: overLimit, mediaType: 'image/png' }),
     (err) => String(err.code) === 'IMAGE_TOO_LARGE' || /too.?large/i.test(String(err.message)),

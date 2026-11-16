@@ -1,3 +1,4 @@
+import hostExecutors from './host-executors.cjs'
 // Real Cordis plugin scopes/services; transient LLM capability and projection failures.
 // Only synthetic Feishu network and model metadata are fake. No desktop access.
 'use strict'
@@ -87,7 +88,7 @@ async function main() {
   await ctx.plugin(SandboxPolicy, { workspaceRoot: ws })
   await ctx.plugin(AttachmentLocal, { dshHome: home })
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(ToolRuntime); await hostExecutors.native(ctx)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(Jsonl, { root: path.join(home, 'sessions') })
   await ctx.plugin(AgentLoop, { agents: [] })
