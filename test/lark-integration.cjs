@@ -23,6 +23,8 @@ const createdAgents = []
 const persistedSessions = new Set()
 
 // ── wire 记录：每个 curl 调用的 method/url/headers/body（body 是字符串）──────────
+let commandBotFailures = 0
+const commandMessageFixtures = new Map()
 const wire = []
 let wireIdSeq = 0
 let holdNext = null // { match, deferred } —— 挂住下一个命中的请求（reload 在途用例）
@@ -149,6 +151,11 @@ function parseCurlConfig(stdin) {
 
 function routeResponseBody(parsed) {
   const url = parsed.url
+  if (url.includes('/bot/v3/info')) { if (commandBotFailures-- > 0) return JSON.stringify({code:1}); return JSON.stringify({code:0,bot:{open_id:'ou_command_bot'}}) }
+  if (parsed.method === 'GET') {
+    const item = commandMessageFixtures.get(decodeURIComponent(new URL(url).pathname.split('/').at(-1)))
+    if (item) return JSON.stringify({code:0,data:{items:[item]}})
+  }
   if (url.includes('/auth/v3/tenant_access_token/internal')) {
     // token 按 app_id 派生：区分 OLD/NEW 应用身份，供 token 按 runtime 隔离回归。
     let appId = 'unknown'
@@ -2395,6 +2402,112 @@ async function main() {
     const whAgent = createdAgents[createdAgents.length - 1].agent
     assert.equal(whAgent.messages.filter((m) => String(m.id).startsWith('lark-')).length, 1, 'W：同 body 重试不重复，恰一入队')
     await lease2.close()
+  }
+
+  // Commands traverse the actual authenticated webhook, durable claim/notice and recovery.
+  {
+    const { openLarkDedupStore, larkDedupKey } = await import('../lib/lark-dedup.js')
+    const { createLarkSessionGenerations } = await import('../lib/lark-session-generation.js')
+    const cfg = readConfig(); cfg.adapters.lark.commands = { enabled:true, allowedOpenIds:['ou_command_admin'] }
+    await saveConfig(cfg)
+    const appId = cfg.adapters.lark.appId, lease = await openLarkDedupStore(path.join(fixtureDshHome,'lark-dedup'))
+    let seq=0
+    const terminal = async (id, state='rejected') => {
+      for(let i=0;i<240;i++){const row=lease.get(larkDedupKey(appId,id));if(row?.state===state)return row;await wait(25)}
+      assert.fail('command did not settle rejected with notice')
+    }
+    const post = async (text, options={}) => {
+      const id=options.id||'om_command_'+(++seq), chat=options.chat||'oc_command_dm', group=options.group===true
+      const message={message_id:id,chat_id:chat,chat_type:group?'group':'p2p',message_type:'text',create_time:String(Date.now()),mentions:group&&options.mention!==false?[{key:'@_user_1',id:{open_id:'ou_command_bot'}}]:[],content:JSON.stringify({text:group&&options.mention!==false?'@_user_1 '+text:text})}
+      commandMessageFixtures.set(id,{...message,msg_type:'text',sender:{sender_type:'user',id_type:'open_id',id:options.sender||'ou_command_admin'},body:{content:message.content}})
+      const body={token:cfg.adapters.lark.verificationToken,type:'im.message.receive_v1',sender:{sender_type:'user',sender_id:{open_id:options.sender||'ou_command_admin'}},message}
+      const mark=wire.length
+      const response=await invoke('POST','/messaging/lark/events',{body:JSON.stringify(body),headers:{'Content-Type':'application/json'}})
+      assert.equal(response.status,200)
+      return {id,mark,message}
+    }
+    const atStart=createdAgents.length
+    const help=await post('/help');await terminal(help.id);assert.equal(createdAgents.length,atStart,'help never creates/resumes a session')
+    assert.ok(JSON.stringify(wire.slice(help.mark)).includes('/model'))
+    assert.ok(msgs(wire.slice(help.mark))[0].headers.Authorization?.startsWith('Bearer '),'command reply carries runtime authentication')
+    await post('/help',{id:help.id});await wait(50);assert.equal(msgs(wire.slice(help.mark)).length,1,'terminal replay emits zero extra notice')
+    const normal=await post('hello commands');await wait(60)
+    const old=createdAgents.at(-1).agent,oldSid=old.session.id
+    assert.ok(old.messages.some(m=>m.content[0].text.startsWith('hello commands')))
+    let cancelled=0,disposed=0,selected={provider:'test-provider',model:'test-model'},selects=0
+    old.status='running';old.cancel=(cause,opts)=>{assert.deepEqual(opts,{keepInbox:true});cancelled++;old.status='idle'}
+    old.model={current:()=>selected,select:value=>{selected=value;selects++}}
+    createdAgents.at(-1).handle.dispose=async()=>{disposed++}
+    const stop=await post('/stop');await terminal(stop.id);assert.equal(cancelled,1)
+    const count=old.messages.length
+    const stat=await post('/status');await terminal(stat.id);assert.ok(JSON.stringify(wire.slice(stat.mark)).includes('ou_command_admin'));assert.equal(old.messages.length,count)
+    const oldLlm=ctx.llm
+    Object.assign(ctx.llm,{listProviders:()=>[{id:'test-provider'}],listModels:async()=>[{id:'test-model',name:'Default'},{id:'second',name:'Second'}],resolveCallConfig:async x=>x})
+    const model=await post('/model switch 2');await terminal(model.id);assert.equal(selects,1);assert.equal(selected.model,'second');assert.deepEqual(ctx.agentDefaultModel.currentSelection(),{provider:'test-provider',model:'test-model'})
+    old.status='running';const busy=await post('/model switch 1');await terminal(busy.id);assert.equal(selects,1);old.status='idle'
+    const invalid=await post('/model 2');await terminal(invalid.id);assert.equal(old.messages.length,count);assert.ok(JSON.stringify(wire.slice(invalid.mark)).includes('用法'))
+    const listed=await post('/model list',{group:true,chat:'oc_command_group',sender:'ou_outside'});await terminal(listed.id);assert.ok(JSON.stringify(wire.slice(listed.mark)).includes('1:test-provider/test-model'))
+    const deniedSwitch=await post('/model switch -t 1',{group:true,chat:'oc_command_group',sender:'ou_outside'});await terminal(deniedSwitch.id);assert.ok(JSON.stringify(wire.slice(deniedSwitch.mark)).includes('你没有执行此命令的权限'));assert.equal(selects,1)
+    const denied=await post('/new',{group:true,chat:'oc_command_group',sender:'ou_outside'});await terminal(denied.id);assert.ok(JSON.stringify(wire.slice(denied.mark)).includes('你没有执行此命令的权限'))
+    const groupStatus=await post('/status',{group:true,chat:'oc_command_group',sender:'ou_outside'});await terminal(groupStatus.id);assert.ok(!JSON.stringify(msgs(wire.slice(groupStatus.mark))).includes('ou_outside'))
+    const groupHelp=await post('/help',{group:true,chat:'oc_command_group',sender:'ou_outside'});await terminal(groupHelp.id)
+    const newCmd=await post('/new');await terminal(newCmd.id);assert.equal(disposed,1);assert.ok(persistedSessions.has(oldSid),'old history retained')
+    const next=await post('after new');await wait(60);const fresh=createdAgents.at(-1)
+    assert.notEqual(fresh.agent.session.id,oldSid);assert.equal(fresh.options.agentOptions.model,'test-model')
+    await post('/new',{id:newCmd.id});await wait(40)
+    const gen=createLarkSessionGenerations(path.join(fixtureDshHome,'lark-session-generations-v1'))
+    assert.equal(gen.current(appId+'|lark:oc_command_dm','lark:oc_command_dm').generation,1)
+    // Simulate crash after claim/bind: recovery fetches authoritative text BEFORE any resume.
+    for(const [name,argument] of [['stop',''],['model',' switch 2'],['help','']]){
+      const id='om_command_recovery_'+name
+      const row=(await lease.claim({appId,messageId:id,chatId:'oc_command_dm',chatType:'p2p',sessionId:fresh.agent.session.id})).record
+      await lease.bindRoute(row.key,{sessionId:fresh.agent.session.id,sessionExisted:true});lease.release(row.key)
+      commandMessageFixtures.set(id,{message_id:id,chat_id:'oc_command_dm',msg_type:'text',create_time:String(Date.now()-61000),sender:{sender_type:'user',id_type:'open_id',id:'ou_command_admin'},body:{content:JSON.stringify({text:'/'+name+argument})}})
+    }
+    const previousResumes=ctx.agents.resume
+    let resumedCommands=0;ctx.agents.resume=async function(...args){resumedCommands++;return previousResumes.apply(this,args)}
+    await invoke('POST','/__dsh-messaging/reload')
+    for(const name of ['stop','model','help'])await terminal('om_command_recovery_'+name)
+    assert.equal(resumedCommands,0,'expired mutations/help recovery never resumes or submits a prompt')
+    ctx.agents.resume=previousResumes
+    assert.equal(cancelled,1);assert.equal(selects,1)
+    commandBotFailures=1
+    const unmentionedOffline=await post('/stop',{group:true,chat:'oc_command_unmentioned_offline',mention:false})
+    await terminal(unmentionedOffline.id,'delivered')
+    assert.equal(commandBotFailures,1,'unmentioned group text does not query bot identity even when that API is unavailable')
+    const retry=await post('/help',{group:true,chat:'oc_command_retry'})
+    await terminal(retry.id)
+    assert.ok(JSON.stringify(wire.slice(retry.mark)).includes('/model'),'bot identity failure retains recovery scheduling, then sends help')
+    const noMention=await post('/stop',{group:true,chat:'oc_command_without_mention',mention:false})
+    await terminal(noMention.id,'delivered')
+    assert.ok(createdAgents.at(-1).agent.messages.some(m=>m.content[0].text.startsWith('/stop')),'unmentioned group text follows the original prompt path')
+    const groupNew=await post('/new',{group:true,chat:'oc_command_admin_new'})
+    await terminal(groupNew.id)
+    assert.equal(gen.current(appId+'|lark:oc_command_admin_new','lark:oc_command_admin_new').generation,1,'allowlisted group operator may start a new session')
+    const emptyConfig=readConfig();emptyConfig.adapters.lark.commands.allowedOpenIds=[];await saveConfig(emptyConfig)
+    const emptyDenied=await post('/new',{group:true,chat:'oc_command_empty'})
+    await terminal(emptyDenied.id)
+    assert.ok(JSON.stringify(wire.slice(emptyDenied.mark)).includes('你没有执行此命令的权限'),'empty list denies group mutations')
+    const disabledConfig=readConfig();disabledConfig.adapters.lark.commands.enabled=false;await saveConfig(disabledConfig)
+    const disabled=await post('/help',{chat:'oc_command_disabled'})
+    await terminal(disabled.id,'delivered')
+    assert.ok(createdAgents.at(-1).agent.messages.some(m=>m.content[0].text.startsWith('/help')),'disabled commands use the unchanged normal prompt path')
+    const sharedConfig=readConfig();sharedConfig.adapters.lark.commands.enabled=true;await saveConfig(sharedConfig)
+    sessionBusy.mode='reuse'
+    const sharedPrompt=await post('shared history',{chat:'oc_command_shared'})
+    await terminal(sharedPrompt.id,'delivered')
+    const sharedAgent=sessionBusy.live
+    let externalDispose=0;sharedAgent.dispose=()=>{externalDispose++};sharedAgent.status='idle'
+    const sharedNew=await post('/new',{chat:'oc_command_shared'});await terminal(sharedNew.id)
+    assert.equal(externalDispose,0,'new never disposes a desktop-owned agent')
+    const afterDetach=wire.length
+    finalMessage(sharedAgent,1,0,'desktop output after detachment');turnEnd(sharedAgent,1,'completed')
+    frameChunk(sharedAgent,{attemptId:'detached',revision:1,index:0,text:'late shared frame'})
+    await wait(THROTTLE_WAIT)
+    assert.equal(msgs(wire.slice(afterDetach)).length,0,'detached old desktop agent cannot keep sending to Feishu')
+    sessionBusy.mode='off'
+    await lease.close()
+    console.log('lark commands integrated: auth/list/notice-rejected/new-route/defaults/expiry-recovery/replay-zero')
   }
 
   // ── dispose 卫生可观察：释放后计时器/队列已清——不再产生新告知 wire ──────

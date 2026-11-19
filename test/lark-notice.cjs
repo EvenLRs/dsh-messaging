@@ -138,7 +138,7 @@ async function main() {
     const badKind = await sendLarkNotice({ receipts, wire, key: 'k7', kind: 'not_a_kind', appId: 'cli_x', conversation: 'lark:oc_y', chatId: 'oc_y', interactiveCard: true, now: () => 1000 })
     assert.equal(badKind.outcome, 'invalid_kind', '未知 kind 不发送')
     assert.equal(calls.length, 1, '后两者零 wire')
-    assert.equal(LARK_NOTICE_KINDS.length, 10, 'kind 枚举固定（6 恢复类 + waiting + 3 图片类）')
+    assert.equal(LARK_NOTICE_KINDS.length, 11, 'kind 枚举固定（原10类 + command独立业务类型）')
     const { calls: cw, wire: ww } = makeWire(() => ({ ok: true, status: 200, json: { code: 0, data: { message_id: 'om_nw' } } }))
     const rw = await sendLarkNotice({ receipts: makeReceipts(), wire: ww, key: 'kw', kind: 'waiting_for_input', appId: 'cli_x', conversation: 'lark:oc_y', chatId: 'oc_y', interactiveCard: true, now: () => 1000 })
     assert.equal(rw.outcome, 'delivered', 'waiting_for_input 可正常送达')

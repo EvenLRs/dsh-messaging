@@ -132,6 +132,8 @@ async function main() {
     assert.equal(node.meta.volatile, true, fieldPath + ' must be volatile (settings cannot write it otherwise)')
   }
 
+  for (const allowed of [['ou_admin'], []]) assert.equal(validate(Config, { adapters: { lark: { commands: { allowedOpenIds: allowed } } } }).issues, undefined)
+  for (const allowed of [['bad'], ['ou_'], ['ou_good', 'bad'], 'ou_admin']) assert.ok(validate(Config, { adapters: { lark: { commands: { allowedOpenIds: allowed } } } }).issues, 'invalid group controller IDs rejected by server schema')
   // ── 4. 表单字段都是 volatile；安装环境派生值不是 ───────────────────────────
   const volatilePaths = leaves
     .filter((entry) => entry.meta.volatile)
@@ -142,7 +144,10 @@ async function main() {
   for (const [key, value] of Object.entries(expected.agent)) formPaths.push('agent.' + key)
   ordinaryPaths.push(...Object.keys(expected.runtime).map((key) => 'runtime.' + key))
   for (const channel of Object.keys(expected.adapters)) {
-    for (const key of Object.keys(expected.adapters[channel])) formPaths.push('adapters.' + channel + '.' + key)
+    for (const key of Object.keys(expected.adapters[channel])) {
+      if (channel === 'lark' && key === 'commands') for (const child of Object.keys(expected.adapters[channel][key])) formPaths.push('adapters.lark.commands.' + child)
+      else formPaths.push('adapters.' + channel + '.' + key)
+    }
   }
   assert.deepEqual(volatilePaths, formPaths.sort(), 'every page-editable field must be volatile')
   for (const fieldPath of ordinaryPaths) {

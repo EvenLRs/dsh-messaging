@@ -80,10 +80,28 @@ const plugin = await import(pathToFileURL(implFiles.index).href)
 const { openLarkDedupStore, larkDedupKey, LARK_DEDUP_JOURNAL_NAME } = await import(pathToFileURL(implFiles.ledger).href)
 const { larkAdmissionVerdict, larkAdmissionInboxIds, LARK_ADMISSION_KEY } = await import(pathToFileURL(implFiles.admission).href)
 
+const commandHostRequests = []
+const heldModelTurns = new Map()
 class Mock extends llm.LlmAdapter {
   constructor() { super(); this.n = 0 }
   resolveModel(provider, model) { return Promise.resolve({ provider, id: model, name: model }) }
-  async *stream() {
+  async listModels(provider) { return [{provider,id:'m',name:'Default'},{provider,id:'second',name:'Second'}] }
+  async *stream(request) {
+    commandHostRequests.push(request.model)
+    const held = heldModelTurns.get(JSON.stringify(request.messages.at(-1)).match(/hold-v6-(normal|cancel|failure)/)?.[0])
+    if (held) {
+      held.started(request.model)
+      const outcome = await held.finish(request.signal)
+      if (outcome === 'failure') throw new Error('synthetic held model failure')
+      if (outcome === 'cancel') return
+    }
+    if (JSON.stringify(request.messages.at(-1)).includes('command synthetic error')) throw new Error('synthetic model error')
+    if (JSON.stringify(request.messages.at(-1)).includes('command long')) {
+      yield {type:'block-start',index:0,blockType:'text'}
+      yield {type:'text-delta',index:0,text:'synthetic long reply'}
+      await new Promise(resolve => { if(request.signal.aborted)resolve();else request.signal.addEventListener('abort',resolve,{once:true}) })
+      return
+    }
     this.n += 1
     const t = 'ok' + this.n
     yield { type: 'block-start', index: 0, blockType: 'text' }
@@ -132,12 +150,24 @@ async function makeEnv(name, opts = {}) {
   const counters = { created: 0, resumed: 0, resumedSids: [] }
   const envHooks = { faultFollowup: false }
   const seenAgents = []
+  const recoveryMessages = new Map()
   const fakeShell = {
     resolve: (request) => request,
     async run(request) {
       shellCalls.push(request)
       // 默认：飞书 HTTP API 成功（固定告知可送达）；测试可注入失败答案。
-      const payload = '{"code":0,"data":{"message_id":"om_notice_1"}}'
+      if (opts.commandAuth && String(request.stdin).includes('/im/v1/messages?')) assert.ok(String(request.stdin).includes('Authorization: Bearer synthetic-command-token'), 'command fixture requires real host token plumbing, not an unauthenticated fake success')
+      const recoveryId = /\/im\/v1\/messages\/([a-zA-Z0-9_]+)/.exec(String(request.stdin))?.[1]
+      const fixture = recoveryMessages.get(recoveryId)
+      if (fixture) {
+        fixture.requests += 1
+        if (fixture.failures > 0) {
+          fixture.failures -= 1
+          return { exitCode: 0, stdout: { text: '{"code":500}__DSH_STATUS__:500' } }
+        }
+        return { exitCode: 0, stdout: { text: JSON.stringify({ code: 0, data: { items: [fixture.message] } }) + '__DSH_STATUS__:200' } }
+      }
+      const payload = String(request.stdin).includes('/auth/v3/') ? '{"code":0,"tenant_access_token":"synthetic-command-token","expire":7200}' : '{"code":0,"data":{"message_id":"om_notice_1","card_id":"synthetic_card"}}'
       return {
         exitCode: 0, signal: null, timedOut: false, aborted: false,
         stdout: { text: payload + '__DSH_STATUS__:200', truncated: false },
@@ -168,6 +198,7 @@ async function makeEnv(name, opts = {}) {
   ctx.provide('shell', fakeShell)
   ctx.provide('fs', fsService)
   ctx.provide('agentDefaultModel', { currentSelection() { return { provider: 'mock', model: 'm' } } })
+  if (opts.clock) ctx.provide('dshMessaging.larkRecoveryClock', opts.clock)
   ctx.provide('dsh.home', home) // 真实插件的 ledger 根 seam（临时 DSH_HOME，不碰 ~/.dsh）
   // 真实栈（与生产组合同族、同挂载顺序；storage 层为 cache 冷恢复提供真实介质）。
   await ctx.plugin(llm.default)
@@ -201,7 +232,7 @@ async function makeEnv(name, opts = {}) {
     return handle
   }
   const env = {
-    name, home, ws, ctx, routes, shellCalls, counters, envHooks, seenAgents,
+    name, home, ws, ctx, routes, shellCalls, counters, envHooks, seenAgents, recoveryMessages,
     ledgerPath: path.join(home, 'lark-dedup'),
     agents: {
       async create(options) { counters.created += 1; return wrapHandle(await origCreate(options)) },
@@ -214,12 +245,17 @@ async function makeEnv(name, opts = {}) {
   const config = plugin.defaultConfig(ws)
   config.adapters.lark = Object.assign({}, config.adapters.lark, {
     enabled: true, mode: 'webhook', appId: 'cli_test', appSecret: 'secret',
-    verificationToken: 'tok123', interactiveCard: false,
+    verificationToken: 'tok123', interactiveCard: opts.interactiveCard === true,
   })
   config.agent = Object.assign({}, config.agent, { provider: 'mock', model: 'm', cwd: ws })
   if (!opts.skipApply) {
     if (typeof opts.beforeApply === 'function') await opts.beforeApply(env)
-    await plugin.apply(ctx, config)
+    if (opts.scopedCommands) {
+      await ctx.plugin((await imp('cordis-plugin-timer')).default)
+      env.messagingFiber = await ctx.plugin(plugin, config)
+    } else {
+      await plugin.apply(ctx, config)
+    }
     await tick()
   }
   env.dispose = async () => { await ctx.fiber.dispose() }
@@ -257,6 +293,14 @@ function extractNoticeTexts(shellCalls) {
     } catch { /* 非告知请求（如 GET）跳过 */ }
   }
   return texts
+}
+async function assertOneWaitingNotice(env, label) {
+  const count = () => countOccurrences(extractNoticeTexts(env.shellCalls).join('\n'), '需要后续输入时继续处理')
+  // Recovery settles delivered before dispatching its separate notice.
+  await waitFor(label, () => count() > 0, 12000)
+  // Keep watching briefly after the first notice so an immediate duplicate fails.
+  await new Promise(resolve => setTimeout(resolve, 200))
+  assert.equal(count(), 1, label)
 }
 async function postText(env, { messageId, chatId, text, chatType = 'p2p' }) {
   const handler = env.routes.get('/messaging/lark/events')
@@ -509,8 +553,7 @@ async function scenario4a() {
   assert.equal(inboxIds.filter((id) => id === ref.umid).length, 1, 'S4a: exactly one pending copy in the inbox — recovery never re-followuped it')
   assert.ok(inboxIds.includes(ref.umid), 'S4a: pending still parked in the inbox (host fact: waits for later legitimate input; no public wake API is used)')
   assert.equal(assistantCount(agent), 0, 'S4a: recovery never woke the driver or consumed the pending message (no turn ran)')
-  const notices4a = extractNoticeTexts(env.shellCalls)
-  assert.equal(countOccurrences(notices4a.join('\n'), '需要后续输入时继续处理'), 1, 'S4a: fixed waiting_for_input notice fired once (inbox hit after admitted)')
+  await assertOneWaitingNotice(env, 'S4a: fixed waiting_for_input notice fired once (inbox hit after admitted)')
   await ref.lease.close()
   await env.dispose()
   console.log('PASS S4a same-process busy reuse: admitted once, waiting notice, no wake (NOT a cold start; cold path is S4c)')
@@ -607,8 +650,7 @@ async function scenario4c() {
   assert.equal(inboxAfter.filter((x) => x === umidC).length, 1, 'S4c: after a full host teardown + fresh ctx, the pending copy is still exactly one')
   assert.equal(userMsgCount(agentB, umidC), 0, 'S4c: pending is not yet consumed (not re-followuped, not driven)')
   assert.equal(assistantCount(agentB), 0, 'S4c: no private wake happened on restore (no turn ran)')
-  const noticesC = extractNoticeTexts(envB.shellCalls)
-  assert.ok(noticesC.some((t) => t.includes('需要后续输入时继续处理')), 'S4c: waiting_for_input notice after cold restore admitted')
+  await assertOneWaitingNotice(envB, 'S4c: waiting_for_input notice fired once after cold restore admitted')
   // 独立合法新输入触发消费（等价宿主面用户输入→agent.followup；新 id，不是同 id 再 followup）。
   const kickUmid = 'lark-' + umidC.slice(5, 13) + '-99-' + 'feedfacefeedface'
   agentB.followup(um(kickUmid, 'legit new input'))
@@ -651,6 +693,278 @@ async function scenario5() {
   console.log('PASS S5 plugin awaits host flush; pending/false stay claimed; real true persists; admitted retry once')
 }
 
+// Drive only plugin timers with virtual time. The real host still streams,
+// records turn/end, and flushes the session normally.
+function recoveryTestClock() {
+  let now = Date.now()
+  const timers = new Map()
+  return {
+    now: () => now,
+    setTimeout(fn, delay) {
+      const handle = {}
+      timers.set(handle, { due: now + delay, fn })
+      return handle
+    },
+    clearTimeout(handle) { timers.delete(handle) },
+    async advance(ms = 0) {
+      now += ms
+      for (const [handle, timer] of timers) {
+        if (timer.due > now) continue
+        timers.delete(handle)
+        timer.fn()
+      }
+      await tick()
+    },
+  }
+}
+
+async function scenarioTemporaryModelWaiters() {
+  const clock = recoveryTestClock()
+  const env = await makeEnv('temporary-model-waiters', { commandAuth: true, clock })
+  const lease = await openLarkDedupStore(env.ledgerPath)
+  const chatId = 'oc_wait_v6'
+  const row = id => lease.get(larkDedupKey('cli_test', id))
+  const post = (id, text) => postText(env, { chatId, messageId: id, text })
+  async function until(label, predicate) {
+    const deadline = Date.now() + 12000
+    while (!predicate()) {
+      if (Date.now() >= deadline) throw new Error('timeout waiting for ' + label)
+      await clock.advance()
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+  }
+  const settle = (id, state) => until(id + ' ' + state, () => row(id)?.state === state)
+  function fixture(id, text) {
+    const entry = {
+      requests: 0, failures: 0,
+      message: { message_id: id, chat_id: chatId, chat_type: 'p2p', msg_type: 'text', body: { content: JSON.stringify({ text }) } },
+    }
+    env.recoveryMessages.set(id, entry)
+    return entry
+  }
+  async function parked(id) {
+    await until('released claimed waiter ' + id, () => row(id)?.state === 'claimed' && !lease.isProcessing(row(id).key))
+  }
+
+  try {
+    await post('om_wait_init', 'initial model')
+    await settle('om_wait_init', 'delivered')
+    const sid = row('om_wait_init').sessionId
+    const agent = env.ctx.agents.get(sess.SessionId(sid))
+    await agent.whenIdle()
+    for (const outcome of ['normal', 'cancel', 'failure']) {
+      const marker = 'hold-v6-' + outcome
+      const commandId = 'om_wait_switch_' + outcome
+      const longId = 'om_wait_long_' + outcome
+      const nextId = 'om_wait_next_' + outcome
+      let started, finish
+      const starting = new Promise(resolve => { started = resolve })
+      const ending = new Promise(resolve => { finish = resolve })
+      heldModelTurns.set(marker, {
+        started,
+        finish: signal => Promise.race([ending, new Promise(resolve => {
+          if (signal.aborted) resolve('cancel')
+          else signal.addEventListener('abort', () => resolve('cancel'), { once: true })
+        })]),
+      })
+      await post(commandId, '/model switch -t 2')
+      await settle(commandId, 'rejected')
+      await post(longId, marker)
+      await settle(longId, 'delivered')
+      assert.equal(await starting, 'second', 'held turn uses the temporary model')
+      const nextText = 'waiting behind ' + outcome
+      const next = fixture(nextId, nextText)
+
+      // Force a real recovery-queue attempt before parking one of the rows.
+      // Its first lookup succeeds. The model barrier is its only reason to wait.
+      if (outcome === 'normal') {
+        const claim = await lease.claim({ appId: 'cli_test', messageId: nextId, chatId, chatType: 'p2p', sessionId: sid, sessionExisted: true })
+        lease.release(claim.record.key)
+      }
+      await post(nextId, nextText)
+      await clock.advance()
+      await parked(nextId)
+      assert.equal(next.requests, outcome === 'normal' ? 1 : 0)
+      const immediateId = 'om_wait_immediate_' + outcome
+      const immediate = fixture(immediateId, 'immediate after ' + outcome)
+      await post(immediateId, 'immediate after ' + outcome)
+      await parked(immediateId)
+      for (let i = 0; i < 20; i++) await clock.advance(5000)
+      assert.equal(row(nextId).state, 'claimed')
+      assert.equal(userMsgCount(agent, row(nextId).userMessageId), 0)
+      assert.equal(next.requests, outcome === 'normal' ? 1 : 0, '100 simulated seconds without polling the parked row')
+      assert.equal(immediate.requests, 0)
+
+      if (outcome === 'normal') next.failures = 4
+      const releasedAt = clock.now()
+      if (outcome === 'cancel') {
+        await post('om_wait_cancel', '/stop')
+        await settle('om_wait_cancel', 'rejected')
+      } else {
+        finish(outcome)
+      }
+      await settle(immediateId, 'delivered')
+      assert.equal(clock.now(), releasedAt, 'restoring the model wakes parked rows without advancing the backoff clock')
+      await agent.whenIdle()
+      assert.equal(userMsgCount(agent, row(immediateId).userMessageId), 1)
+      assert.equal(commandHostRequests.at(-1), 'm', 'the released turn uses the original model')
+
+      if (outcome === 'normal') {
+        const delays = [5000, 10000, 20000, 40000]
+        for (let i = 0; i < delays.length; i++) {
+          await until('real GET failure ' + i, () => next.requests === i + 2 && !lease.isProcessing(row(nextId).key))
+          await tick()
+          await clock.advance(delays[i])
+        }
+      }
+      await settle(nextId, 'delivered')
+      await agent.whenIdle()
+      assert.equal(userMsgCount(agent, row(nextId).userMessageId), 1)
+      assert.equal(next.requests, outcome === 'normal' ? 6 : 1, 'parking leaves the full five real-attempt budget')
+      assert.equal(commandHostRequests.at(-1), 'm')
+      await post(nextId, nextText)
+      await clock.advance()
+      assert.equal(userMsgCount(agent, row(nextId).userMessageId), 1, 'terminal platform replay does not re-admit')
+      heldModelTurns.delete(marker)
+    }
+  } finally {
+    heldModelTurns.clear()
+    await lease.close()
+    await env.dispose()
+  }
+  console.log('PASS E14 temporary model waiters: 100s with no polling, immediate wake on normal/error/stop, full real-retry budget, original model exactly once')
+}
+
+async function scenarioCommands() {
+  const env=await makeEnv('commands',{interactiveCard:true,commandAuth:true,scopedCommands:true})
+  const lease=await openLarkDedupStore(env.ledgerPath)
+  const settle=async(id,state)=>waitFor('command '+id,()=>lease.get(larkDedupKey('cli_test',id))?.state===state)
+  await postText(env,{messageId:'om_cmd_first',chatId:'oc_cmd',text:'hello'})
+  await settle('om_cmd_first','delivered')
+  const sid=lease.get(larkDedupKey('cli_test','om_cmd_first')).sessionId
+  let agent=env.ctx.agents.get(sess.SessionId(sid));await agent.whenIdle()
+  assert.throws(() => env.messagingFiber.ctx.llm, /cannot get property "llm" without inject/)
+  console.log('Desktop-like Cordis fiber rejects direct ctx.llm access: cannot get property "llm" without inject')
+  const commandChecks = [
+    ['/help', '/model list'],
+    ['/status', '会话状态：空闲'],
+    ['/model', '当前模型：mock/Default'],
+    ['/model list', '1:mock/m'],
+    ['/model switch 1', '已切换为 mock/m（Default）'],
+    ['/stop', '当前没有进行中的回复'],
+    ['/new', '已开始新会话'],
+  ]
+  const failedScopedCommands = []
+  for (const [index, [text, expected]] of commandChecks.entries()) {
+    const messageId = 'om_scope_command_' + index
+    const mark = env.shellCalls.length
+    await postText(env, { messageId, chatId: index === 6 ? 'oc_scoped_new' : 'oc_cmd', text })
+    await settle(messageId, 'rejected')
+    const reply = JSON.stringify(env.shellCalls.slice(mark))
+    if (!reply.includes(expected) || reply.includes('命令暂时无法执行，请稍后重试')) {
+      failedScopedCommands.push(text)
+      console.error('Scoped command failed: ' + text + (reply.includes('命令暂时无法执行，请稍后重试') ? ' — generic failure reply' : ' — missing expected reply'))
+    }
+  }
+  assert.deepEqual(failedScopedCommands, [], 'all seven command forms work in the registered plugin fiber')
+  // A catalog exception produces a fixed enum in status, never its payload.
+  const originalListProviders = env.ctx.llm.listProviders
+  env.ctx.llm.listProviders = () => { throw Error('synthetic-private-command-error') }
+  try {
+    await postText(env, { messageId: 'om_scoped_diag', chatId: 'oc_cmd', text: '/model list' })
+    await settle('om_scoped_diag', 'rejected')
+  } finally { env.ctx.llm.listProviders = originalListProviders }
+  const diagnostics = await statusOf(env)
+  assert.ok(diagnostics.recent.some(event => event.kind === 'lark-command' && event.reason === 'reply_exception'))
+  assert.ok(!JSON.stringify(diagnostics).includes('synthetic-private-command-error'))
+  console.log('PASS scoped Cordis command matrix: all seven forms and redacted failure diagnostic')
+  await postText(env,{messageId:'om_cmd_model',chatId:'oc_cmd',text:'/model switch 2'})
+  await settle('om_cmd_model','rejected')
+  assert.equal(agent.model.current().model,'second')
+  assert.deepEqual(env.ctx.agentDefaultModel.currentSelection(),{provider:'mock',model:'m'})
+  await postText(env,{messageId:'om_cmd_next',chatId:'oc_cmd',text:'use next model'})
+  await settle('om_cmd_next','delivered');await agent.whenIdle()
+  assert.equal(commandHostRequests.at(-1),'second','real adapter receives changed selection')
+  await postText(env,{messageId:'om_cmd_temp',chatId:'oc_cmd',text:'/model switch -t 1'})
+  await settle('om_cmd_temp','rejected')
+  assert.equal(agent.model.current().model,'second','pending temporary keeps original until admission')
+  await postText(env,{messageId:'om_cmd_temp_status',chatId:'oc_cmd',text:'/model'})
+  await settle('om_cmd_temp_status','rejected')
+  assert.ok(JSON.stringify(env.shellCalls).includes('下一条消息将使用'))
+  await postText(env,{messageId:'om_cmd_temp_next',chatId:'oc_cmd',text:'temporary turn'})
+  await settle('om_cmd_temp_next','delivered');await agent.whenIdle()
+  assert.equal(commandHostRequests.at(-1),'m','real temporary next turn selection')
+  await waitFor('temporary restored',()=>agent.model.current().model==='second')
+  await postText(env,{messageId:'om_cmd_error_temp',chatId:'oc_cmd',text:'/model switch -t 1'})
+  await settle('om_cmd_error_temp','rejected')
+  await postText(env,{messageId:'om_cmd_error_turn',chatId:'oc_cmd',text:'command synthetic error'})
+  await settle('om_cmd_error_turn','delivered');await agent.whenIdle()
+  assert.equal(commandHostRequests.at(-1),'m')
+  await waitFor('temporary restored after error',()=>agent.model.current().model==='second')
+  await postText(env,{messageId:'om_cmd_restart_temp',chatId:'oc_cmd',text:'/model switch -t 1'})
+  await settle('om_cmd_restart_temp','rejected')
+  const home=env.home,ws=env.ws
+  await lease.close();await env.dispose()
+  const cold=await makeEnv('commands-cold',{home,ws,interactiveCard:true,commandAuth:true,scopedCommands:true})
+  const lease2=await openLarkDedupStore(cold.ledgerPath)
+  // The fixture is outside the desktop backend package. Point runtime-version
+  // resolution at the same extracted entry that the desktop shell launches.
+  const fixtureEntry = process.argv[1]
+  process.argv[1] = path.join(HOST_MODULES, 'dsh-desktop-host', 'lib', 'index.js')
+  try {
+    await postText(cold,{messageId:'om_cmd_cold_status',chatId:'oc_cmd',text:'/status'})
+    await waitFor('cold status restores existing selection',()=>lease2.get(larkDedupKey('cli_test','om_cmd_cold_status'))?.state==='rejected')
+  } finally { process.argv[1] = fixtureEntry }
+  const restored=cold.ctx.agents.get(sess.SessionId(sid))
+  assert.equal(restored.model.current().model,'second','read-only cold status uses persistent selection')
+  assert.equal(cold.counters.created,0,'read-only status never creates a replacement session')
+  const coldWire = JSON.stringify(cold.shellCalls)
+  assert.ok(coldWire.includes('当前模型：mock/Second'),'cold status reply reports persistent model by name')
+  const hostVersion = (await imp('dsh-app-boot')).getDshRuntimeVersion()
+  const pluginVersion = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')).version
+  assert.ok(coldWire.includes('DeepSeek Harness：' + hostVersion + '，已运行 不到 1 小时'), 'status uses the actual host version and process uptime')
+  assert.ok(coldWire.includes('dsh-messaging：' + pluginVersion))
+  assert.match(coldWire, /会话开始时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}/)
+  await postText(cold,{messageId:'om_cmd_stop_temp',chatId:'oc_cmd',text:'/model switch -t 1'})
+  await waitFor('stop temporary pending',()=>lease2.get(larkDedupKey('cli_test','om_cmd_stop_temp'))?.state==='rejected')
+  const longWireStart=cold.shellCalls.length
+  await postText(cold,{messageId:'om_cmd_long',chatId:'oc_cmd',text:'command long'})
+  await waitFor('real long reply active',()=>cold.ctx.agents.get(sess.SessionId(sid))?.status==='running')
+  agent=cold.ctx.agents.get(sess.SessionId(sid))
+  await waitFor('real streaming card created',()=>cold.shellCalls.slice(longWireStart).some(call=>String(call.stdin||'').includes('/cardkit/v1/cards')))
+  const stopWireStart=cold.shellCalls.length
+  await postText(cold,{messageId:'om_cmd_stop',chatId:'oc_cmd',text:'/stop'})
+  await waitFor('stop rejected with delivered notice',()=>lease2.get(larkDedupKey('cli_test','om_cmd_stop'))?.state==='rejected')
+  await agent.whenIdle()
+  assert.equal(agent.status,'idle','real cancel settles the running streaming turn')
+  assert.equal(commandHostRequests.at(-1),'m','stop interrupted temporary model')
+  await waitFor('temporary restored after stop',()=>agent.model.current().model==='second')
+  await waitFor('streaming card closes after cancel',()=>cold.shellCalls.slice(stopWireStart).some(call=>String(call.stdin||'').includes('/settings')&&/streaming_mode.{0,6}false/.test(String(call.stdin))))
+  assert.ok(agent.session.snapshotEvents().some(e=>e.type==='turn/end'&&e.data.reason.kind==='aborted'),'real aborted turn is durable')
+  await postText(cold,{messageId:'om_cmd_new',chatId:'oc_cmd',text:'/new'})
+  await waitFor('new rejected',()=>lease2.get(larkDedupKey('cli_test','om_cmd_new'))?.state==='rejected')
+  await postText(cold,{messageId:'om_cmd_fresh',chatId:'oc_cmd',text:'fresh defaults'})
+  await waitFor('new generation admits',()=>lease2.get(larkDedupKey('cli_test','om_cmd_fresh'))?.state==='delivered')
+  const nextSid=lease2.get(larkDedupKey('cli_test','om_cmd_fresh')).sessionId
+  assert.notEqual(nextSid,sid)
+  const nextAgent=cold.ctx.agents.get(sess.SessionId(nextSid));await nextAgent.whenIdle()
+  assert.equal(nextAgent.model.current().model,'m')
+  assert.equal(userMsgCount(nextAgent,lease2.get(larkDedupKey('cli_test','om_cmd_fresh')).userMessageId),1)
+  assert.equal(agent.session.id,sid,'old session identity remains')
+  await lease2.close();await cold.dispose()
+  const generationCold=await makeEnv('commands-generation-cold',{home,ws,commandAuth:true,scopedCommands:true})
+  const lease3=await openLarkDedupStore(generationCold.ledgerPath)
+  await postText(generationCold,{messageId:'om_cmd_continued',chatId:'oc_cmd',text:'continue generation after restart'})
+  await waitFor('generation cold resume',()=>lease3.get(larkDedupKey('cli_test','om_cmd_continued'))?.state==='delivered')
+  assert.equal(lease3.get(larkDedupKey('cli_test','om_cmd_continued')).sessionId,nextSid,'generation remains stable across plugin teardown')
+  const continued=generationCold.ctx.agents.get(sess.SessionId(nextSid));await continued.whenIdle()
+  assert.equal(userMsgCount(continued,lease3.get(larkDedupKey('cli_test','om_cmd_fresh')).userMessageId),1,'new generation retains its history when resumed')
+  const oldHandle=await generationCold.agents.resume({resumeSessionId:sess.SessionId(sid),agentOptions:{provider:'mock',model:'m'}})
+  assert.equal(userMsgCount(oldHandle.agent,lease3.get(larkDedupKey('cli_test','om_cmd_first')).userMessageId),1,'old session history remains independently resumable')
+  await oldHandle.dispose();await lease3.close();await generationCold.dispose()
+  console.log('PASS commands real host: model next-turn + cold persistence/default reset, streaming cancel/aborted end, generation cold continuation and old history retained')
+}
+
 // ── 主流程 ────────────────────────────────────────────────────────────────
 await scenario1()
 await scenario2()
@@ -659,6 +973,8 @@ await scenario4a()
 await scenario4b()
 await scenario4c()
 await scenario5()
+await scenarioCommands()
+await scenarioTemporaryModelWaiters()
 await Promise.all(tmpDirs.map((dir) => fsp.rm(dir, { recursive: true, force: true })))
 
 // 首末 hash：运行期间实现未被改动（与 Lead 基线的差异只打印，不作失败）。

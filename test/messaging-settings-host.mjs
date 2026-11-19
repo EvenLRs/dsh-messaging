@@ -365,6 +365,22 @@ failure = false; conflict = true; button(tree, '保存').props.onClick(); await 
 assert.equal(input(tree, 'adapters.lark.appId').props.value, 'synthetic', 'conflict reloads and drops old draft'); conflict = false
 writable = false; await root.get('configForms').describe().load(); tree = await draw(entry)
 assert.equal(input(tree, 'adapters.lark.appId').props.disabled, true); writable = true; await root.get('configForms').describe().load()
+// New command settings preserve draft validation and explicit empty-array semantics.
+tree = await draw(entry)
+const controllerField = () => all(tree, row => row.type === 'textarea' && row.props.id === 'dsh-messaging-adapters.lark.commands.allowedOpenIds')[0]
+assert.ok(controllerField(), 'advanced controller list is a multiline input')
+controllerField().props.onChange({target:{value:'not-an-open-id'}});tree=await draw(entry)
+assert.equal(controllerField().props['aria-invalid'],true)
+assert.equal(button(tree,'保存').props.disabled,true,'invalid open IDs cannot be saved')
+controllerField().props.onChange({target:{value:'ou_first\n'}});tree=await draw(entry)
+assert.equal(controllerField().props.value,'ou_first\n','typing Enter retains the multiline draft')
+controllerField().props.onChange({target:{value:controllerField().props.value+'ou_second'}});tree=await draw(entry)
+const countBeforeCommandSave=mutations.length
+button(tree,'保存').props.onClick();await tick();tree=await draw(entry)
+assert.equal(mutations.length,countBeforeCommandSave+1)
+assert.deepEqual(mutations.at(-1).ops,[{op:'set',path:['adapters','lark','commands','allowedOpenIds'],value:['ou_first','ou_second']}])
+controllerField().props.onChange({target:{value:''}});tree=await draw(entry);button(tree,'保存').props.onClick();await tick();tree=await draw(entry)
+assert.deepEqual(mutations.at(-1).ops,[{op:'set',path:['adapters','lark','commands','allowedOpenIds'],value:[]}],'empty group list must set [], never unset')
 unmount(); tree = await draw(diagnostic, { view: 'page' }); tree = await draw(diagnostic, { view: 'page' })
 preview('diagnostics', tree)
 assert.ok(text(tree).includes('未检测')); assert.ok(text(tree).includes('过期'))
