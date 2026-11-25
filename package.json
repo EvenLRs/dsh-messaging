@@ -1,6 +1,6 @@
 {
   "name": "dsh-messaging",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "DSH 消息渠道网关：将Deepseek Harness接入你的IM，随时随地和Deepseek Harness进行沟通",
   "type": "module",
   "main": "lib/index.js",

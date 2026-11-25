@@ -2451,7 +2451,7 @@ async function main() {
     const denied=await post('/new',{group:true,chat:'oc_command_group',sender:'ou_outside'});await terminal(denied.id);assert.ok(JSON.stringify(wire.slice(denied.mark)).includes('你没有执行此命令的权限'))
     const groupStatus=await post('/status',{group:true,chat:'oc_command_group',sender:'ou_outside'});await terminal(groupStatus.id);assert.ok(!JSON.stringify(msgs(wire.slice(groupStatus.mark))).includes('ou_outside'))
     const groupHelp=await post('/help',{group:true,chat:'oc_command_group',sender:'ou_outside'});await terminal(groupHelp.id)
-    const newCmd=await post('/new');await terminal(newCmd.id);assert.equal(disposed,1);assert.ok(persistedSessions.has(oldSid),'old history retained')
+    const newCmd=await post('/new');await terminal(newCmd.id);assert.equal(disposed,0,'old session remains live for the desktop');assert.ok(persistedSessions.has(oldSid),'old history retained')
     const next=await post('after new');await wait(60);const fresh=createdAgents.at(-1)
     assert.notEqual(fresh.agent.session.id,oldSid);assert.equal(fresh.options.agentOptions.model,'test-model')
     await post('/new',{id:newCmd.id});await wait(40)
@@ -2471,6 +2471,38 @@ async function main() {
     assert.equal(resumedCommands,0,'expired mutations/help recovery never resumes or submits a prompt')
     ctx.agents.resume=previousResumes
     assert.equal(cancelled,1);assert.equal(selects,1)
+    // 0.3.7：/new 后旧会话的 owned handle 不释放（桌面端列表保持可见），适配器重建也不释放；
+    // 旧会话的后续输出不再发到飞书；插件整体释放时才统一释放（见文件末尾 retiredProbe 断言）。
+    assert.equal(disposed,0,'retired old session survives adapter reload')
+    createdAgents.find(e=>e.agent===old).retiredProbe=()=>disposed
+    {
+      const mark=wire.length
+      finalMessage(old,9,0,'late retired output');turnEnd(old,9,'completed')
+      frameChunk(old,{attemptId:'retired-old',revision:1,index:0,text:'late retired frame'})
+      await wait(THROTTLE_WAIT)
+      assert.equal(msgs(wire.slice(mark)).length,0,'retired old session cannot send to Feishu')
+    }
+    // 上限 32：第 33 个退役时只释放最早且空闲的那个，其余保持 live。
+    {
+      const retiredEntries=[]
+      for(let i=0;i<33;i++){
+        await post('cap message '+i,{chat:'oc_command_cap'});await wait(60)
+        const entry=createdAgents.at(-1)
+        assert.ok(entry.agent.messages.some(m=>m.content[0].text.startsWith('cap message '+i)),'cap session '+i+' received its message')
+        entry.capDisposals=0;entry.handle.dispose=async()=>{entry.capDisposals++}
+        entry.agent.inbox.nextTurn.length=0 // 模拟已消费：空闲、无待处理输入
+        retiredEntries.push(entry)
+        const cmd=await post('/new',{chat:'oc_command_cap'});await terminal(cmd.id)
+      }
+      await wait(60)
+      assert.equal(new Set(retiredEntries.map(e=>e.agent.session.id)).size,33,'each /new starts a distinct session')
+      // 退役集合 = 先前的 old + 本轮 33 个 = 34 > 32：释放 2 个。old 仍有待处理输入，按规则跳过，
+      // 所以释放的是本轮最早的两个空闲会话；其余 31 个与 old 保持 live。
+      assert.ok(old.inbox.nextTurn.length>0,'precondition: old retired session still has pending input')
+      assert.deepEqual(retiredEntries.slice(0,2).map(e=>e.capDisposals),[1,1],'oldest idle retired sessions released at the cap, once each')
+      assert.deepEqual(retiredEntries.slice(2).map(e=>e.capDisposals),Array(31).fill(0),'newer retired sessions stay live')
+      assert.equal(disposed,0,'a retired session with pending input is never evicted')
+    }
     commandBotFailures=1
     const unmentionedOffline=await post('/stop',{group:true,chat:'oc_command_unmentioned_offline',mention:false})
     await terminal(unmentionedOffline.id,'delivered')
@@ -2517,6 +2549,10 @@ async function main() {
   }
   await wait(6000)
   assert.equal(wire.length, wireBeforeDispose, 'dispose 后无新 wire（恢复计时器/队列已清，零句柄泄漏）')
+  {
+    const probe = createdAgents.find((e) => typeof e.retiredProbe === 'function')
+    if (probe) assert.equal(probe.retiredProbe(), 1, '0.3.7: plugin teardown releases retired /new sessions exactly once')
+  }
 
   console.log('lark-integration ok | wire calls:', wire.length,
     '| cards created:', creates().length, '| PUTs:', puts().length, '| closes:', settingsPatches().length)

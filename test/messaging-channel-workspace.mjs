@@ -1,4 +1,4 @@
-// 0.3.6 渠道默认工作区：lib/messaging-channel-workspace.js 单元回归。
+// 0.3.6/0.3.7 渠道默认工作区与成员登记：lib/messaging-channel-workspace.js 单元回归。
 // 宿主 workspaceController / workspaceRegistry 为同形 fake（规范路径用宿主同款
 // fs/promises realpath）；全部路径在 mkdtemp 临时目录，不触碰真实 ~/.dsh 或 Documents。
 import './_guard.cjs'
@@ -334,6 +334,233 @@ await test('rejection in one channel does not block another channel', async () =
 await test('source uses the host realpath algorithm, not realpathSync.native', () => {
   const source = fs.readFileSync(new URL('../lib/messaging-channel-workspace.js', import.meta.url), 'utf8')
   assert.ok(!/realpathSync\.native|realpath\.native/.test(source), 'host dsh-workspace canonicalizes with fs/promises realpath; .native may differ on Windows')
+})
+
+// ---- 0.3.7 成员登记：lookup / attach ----
+// 与 dsh-workspace 同形的 resolveByPath → { id, path, sessionIds, attachSession, detachSession }。
+function membership(f, { attachImpl, idFor } = {}) {
+  const members = new Map() // workspaceId -> Set(sessionId)
+  const calls = []
+  const resolveCalls = []
+  f.host.registry.resolveByPath = async (p) => {
+    resolveCalls.push(p)
+    let canonical = p
+    try { canonical = await fsp.realpath(p) } catch { /* missing */ }
+    for (const e of f.host.entities.values()) {
+      if (e.path !== canonical) continue
+      const set = members.get(e.workspaceId) || new Set()
+      members.set(e.workspaceId, set)
+      return {
+        id: idFor ? idFor(e) : e.workspaceId,
+        path: e.path,
+        get sessionIds() { return [...set] },
+        async attachSession(id) { calls.push(id); if (attachImpl) await attachImpl(id); set.add(id) },
+        async detachSession(id) { set.delete(id) },
+      }
+    }
+    return undefined
+  }
+  const memberOf = (dir) => {
+    for (const e of f.host.entities.values()) if (e.path === dir) return [...(members.get(e.workspaceId) || [])]
+    return []
+  }
+  return { members, calls, resolveCalls, memberOf }
+}
+const readMarker = (f, ch = 'lark') => JSON.parse(fs.readFileSync(f.marker(ch), 'utf8'))
+
+await test('lookup: no marker → null and never initializes, creates or registers', async () => {
+  const f = await fixture()
+  assert.equal(f.workspaces.lookup('lark'), null)
+  assert.equal(f.host.calls.initializeDefault.length, 0)
+  assert.equal(f.host.calls.create.length, 0)
+  assert.equal(fs.existsSync(path.join(f.canonicalBase, 'lark')), false)
+  assert.equal(fs.existsSync(f.root), false)
+  assert.equal(f.workspaces.lookup('../x'), null)
+  assert.equal(f.workspaces.lookup(''), null)
+})
+
+await test('lookup: returns the validated marker path after resolve; null once registration is gone', async () => {
+  const f = await fixture()
+  const dir = await f.workspaces.resolve('lark')
+  const before = f.host.calls.create.length
+  assert.equal(f.workspaces.lookup('lark'), dir)
+  assert.equal(f.host.calls.create.length, before, 'lookup is read-only')
+  f.host.entities.clear()
+  assert.equal(f.workspaces.lookup('lark'), null)
+})
+
+await test('lookup: 0.3.6 marker without attachedSessionIds stays valid', async () => {
+  const f = await fixture()
+  const dir = await f.workspaces.resolve('lark')
+  const row = readMarker(f)
+  assert.equal(row.attachedSessionIds, undefined, 'resolve alone writes no receipts')
+  const legacy = createChannelWorkspaces({ root: f.root, services: () => ({ controller: f.host.controller, registry: f.host.registry }) })
+  assert.equal(legacy.lookup('lark'), dir)
+  assert.equal(await legacy.resolve('lark'), dir)
+})
+
+await test('attach: joins the channel workspace and appends a durable 0600 receipt', async () => {
+  const f = await fixture()
+  const m = membership(f)
+  const dir = await f.workspaces.resolve('lark')
+  const before = readMarker(f)
+  await f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir })
+  assert.deepEqual(m.calls, ['s-1'])
+  assert.deepEqual(m.memberOf(dir), ['s-1'])
+  const row = readMarker(f)
+  assert.deepEqual(row.attachedSessionIds, ['s-1'])
+  for (const k of ['version', 'channel', 'path', 'workspaceId', 'createdAt']) assert.equal(row[k], before[k], 'marker field kept: ' + k)
+  if (POSIX) assert.equal(fs.statSync(f.marker('lark')).mode & 0o777, 0o600)
+  assert.deepEqual(fs.readdirSync(f.root).filter(n => n.includes('.tmp-')), [], 'no temp files left')
+})
+
+await test('attach: recorded session is never attached again, also after restart', async () => {
+  const f = await fixture()
+  const m = membership(f)
+  const dir = await f.workspaces.resolve('lark')
+  await f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir })
+  await f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir })
+  const restarted = createChannelWorkspaces({ root: f.root, services: () => ({ controller: f.host.controller, registry: f.host.registry }) })
+  await restarted.attach('lark', { sessionId: 's-1', cwd: dir })
+  assert.deepEqual(m.calls, ['s-1'])
+  assert.deepEqual(readMarker(f).attachedSessionIds, ['s-1'])
+})
+
+await test('attach: user removed the session from the workspace → stays removed', async () => {
+  const f = await fixture()
+  const m = membership(f)
+  const dir = await f.workspaces.resolve('lark')
+  await f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir })
+  const ws = await f.host.registry.resolveByPath(dir)
+  await ws.detachSession('s-1')
+  await f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir })
+  assert.deepEqual(m.memberOf(dir), [], 'manual removal respected')
+  assert.deepEqual(m.calls, ['s-1'])
+})
+
+await test('attach: cwd different from the marker path, or no marker → skipped silently', async () => {
+  const f = await fixture()
+  const m = membership(f)
+  await f.workspaces.attach('lark', { sessionId: 's-0', cwd: path.join(f.canonicalBase, 'lark') })
+  assert.equal(fs.existsSync(f.marker('lark')), false, 'attach never creates a marker')
+  const dir = await f.workspaces.resolve('lark')
+  await f.workspaces.attach('lark', { sessionId: 's-1', cwd: f.canonicalBase })
+  await f.workspaces.attach('lark', { sessionId: 's-2', cwd: dir + path.sep + 'sub' })
+  await f.workspaces.attach('telegram', { sessionId: 's-3', cwd: dir })
+  assert.deepEqual(m.calls, [])
+  assert.equal(readMarker(f).attachedSessionIds, undefined)
+})
+
+await test('attach: invalid inputs resolve without touching services', async () => {
+  let touched = 0
+  const f = await fixture({ services: () => { touched += 1; return {} } })
+  for (const args of [['../x', { sessionId: 's', cwd: '/x' }], ['lark', { sessionId: '', cwd: '/x' }], ['lark', { sessionId: 's', cwd: '' }], ['lark', { sessionId: 1, cwd: '/x' }]]) {
+    assert.equal(await f.workspaces.attach(...args), undefined)
+  }
+  assert.equal(touched, 0)
+})
+
+await test('attach: no registry, no resolveByPath, or no workspace at the path → silent, no receipt', async () => {
+  const f = await fixture()
+  const dir = await f.workspaces.resolve('lark')
+  const noRegistry = createChannelWorkspaces({ root: f.root, services: () => ({ controller: f.host.controller }) })
+  await noRegistry.attach('lark', { sessionId: 's-1', cwd: dir })
+  await f.workspaces.attach('lark', { sessionId: 's-2', cwd: dir }) // registry without resolveByPath
+  const m = membership(f)
+  f.host.registry.resolveByPath = async () => undefined
+  await f.workspaces.attach('lark', { sessionId: 's-3', cwd: dir })
+  assert.deepEqual(m.calls, [])
+  assert.equal(readMarker(f).attachedSessionIds, undefined)
+})
+
+await test('attach: workspace at the path carries a different id than the marker → skipped', async () => {
+  const f = await fixture()
+  const m = membership(f, { idFor: () => 'ws-replaced' })
+  const dir = await f.workspaces.resolve('lark')
+  await f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir })
+  assert.deepEqual(m.calls, [])
+  assert.equal(readMarker(f).attachedSessionIds, undefined)
+})
+
+await test('attach: channel registration removed (registry.get misses) → skipped, nothing re-registered', async () => {
+  const f = await fixture()
+  const m = membership(f)
+  const dir = await f.workspaces.resolve('lark')
+  const creates = f.host.calls.create.length
+  f.host.entities.clear()
+  await f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir })
+  assert.deepEqual(m.calls, [])
+  assert.equal(f.host.calls.create.length, creates)
+})
+
+await test('attach: host rejection propagates without receipt, is throttled in-process, retried by a fresh process', async () => {
+  const f = await fixture()
+  let fail = true
+  const m = membership(f, { attachImpl: async () => { if (fail) throw new Error('boom') } })
+  const dir = await f.workspaces.resolve('lark')
+  await assert.rejects(f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir }))
+  assert.equal(readMarker(f).attachedSessionIds, undefined, 'no receipt on failure')
+  fail = false
+  await f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir })
+  const sameProcess = createChannelWorkspaces({ root: f.root, services: () => ({ controller: f.host.controller, registry: f.host.registry }) })
+  await sameProcess.attach('lark', { sessionId: 's-1', cwd: dir })
+  assert.deepEqual(m.calls, ['s-1'], 'throttled for the rest of this process, even across plugin re-apply')
+  await f.workspaces.attach('lark', { sessionId: 's-2', cwd: dir })
+  assert.deepEqual(m.calls, ['s-1', 's-2'], 'throttle is per session, not per channel')
+  const fresh = await import('../lib/messaging-channel-workspace.js?fresh-process=' + Date.now())
+  const next = fresh.createChannelWorkspaces({ root: f.root, services: () => ({ controller: f.host.controller, registry: f.host.registry }) })
+  await next.attach('lark', { sessionId: 's-1', cwd: dir })
+  assert.deepEqual(m.calls, ['s-1', 's-2', 's-1'])
+  assert.deepEqual(readMarker(f).attachedSessionIds, ['s-2', 's-1'])
+})
+
+await test('attach: current() false before or during attachment writes no receipt', async () => {
+  const f = await fixture()
+  let active = true
+  const m = membership(f, { attachImpl: async (id) => { if (id === 's-2') active = false } })
+  const dir = await f.workspaces.resolve('lark')
+  await f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir, current: () => false })
+  assert.deepEqual(m.calls, [], 'not current: host never called')
+  await f.workspaces.attach('lark', { sessionId: 's-2', cwd: dir, current: () => active })
+  assert.deepEqual(m.calls, ['s-2'])
+  assert.equal(readMarker(f).attachedSessionIds, undefined, 'went stale during host attach: no receipt')
+})
+
+await test('attach: concurrent attaches are serialized — same id once, different ids all kept', async () => {
+  const f = await fixture()
+  const m = membership(f, { attachImpl: () => new Promise(r => setTimeout(r, 5)) })
+  const dir = await f.workspaces.resolve('lark')
+  await Promise.all([
+    f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir }),
+    f.workspaces.attach('lark', { sessionId: 's-1', cwd: dir }),
+    f.workspaces.attach('lark', { sessionId: 's-2', cwd: dir }),
+    f.workspaces.attach('lark', { sessionId: 's-3', cwd: dir }),
+  ])
+  assert.deepEqual(m.calls, ['s-1', 's-2', 's-3'])
+  assert.deepEqual(readMarker(f).attachedSessionIds, ['s-1', 's-2', 's-3'], 'no lost update')
+})
+
+await test('attach: receipt list at the 10,000 cap stops auto-joining instead of evicting', async () => {
+  const f = await fixture()
+  const m = membership(f)
+  const dir = await f.workspaces.resolve('lark')
+  const row = readMarker(f)
+  const ids = Array.from({ length: 10000 }, (_, i) => 'old-' + i)
+  fs.writeFileSync(f.marker('lark'), JSON.stringify({ ...row, attachedSessionIds: ids }), { mode: 0o600 })
+  await f.workspaces.attach('lark', { sessionId: 'new', cwd: dir })
+  assert.deepEqual(m.calls, [])
+  assert.equal(readMarker(f).attachedSessionIds.length, 10000)
+  assert.equal(f.workspaces.lookup('lark'), dir, 'full marker still valid')
+})
+
+await test('marker with malformed attachedSessionIds rejects with the fixed message', async () => {
+  for (const bad of ['s-1', [1], [''], Array.from({ length: 10001 }, (_, i) => 'x' + i)]) {
+    const f = await fixture()
+    await f.workspaces.resolve('lark')
+    fs.writeFileSync(f.marker('lark'), JSON.stringify({ ...readMarker(f), attachedSessionIds: bad }))
+    await assert.rejects(f.workspaces.resolve('lark'), (e) => e.message === 'channel_workspace_store_invalid')
+    assert.throws(() => f.workspaces.lookup('lark'), (e) => e.message === 'channel_workspace_store_invalid')
+  }
 })
 
 const failed = results.filter(r => !r.ok)
